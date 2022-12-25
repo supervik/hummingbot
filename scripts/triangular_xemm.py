@@ -16,15 +16,16 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 class TriangularXEMM(ScriptStrategyBase):
     # Config params
-    connector_name: str = "kucoin"
-    maker_pair: str = "XRP-USDT"
-    taker_pair_1: str = "XRP-BTC"
+    connector_name: str = "kucoin_paper_trade"
+    maker_pair: str = "XMR-BTC"
+    taker_pair_1: str = "XMR-USDT"
     taker_pair_2: str = "BTC-USDT"
 
-    min_spread: Decimal = Decimal("1")
-    max_spread: Decimal = Decimal("2")
-    order_amount: Decimal = Decimal("1")
-    target_amount = Decimal("0")
+    min_spread: Decimal = Decimal("0.2")
+    max_spread: Decimal = Decimal("0.5")
+    order_amount: Decimal = Decimal("0.1")
+    target_base_amount = Decimal("0")
+    target_quote_amount = Decimal("1")
     # min_order_amount = Decimal("1")
     # slippage_buffer = Decimal("1")
 
@@ -39,6 +40,12 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_sell_price = 0
     taker_buy_price = 0
     spread = 0
+    maker_base = ""
+    maker_quote = ""
+    taker_1_base = ""
+    taker_1_quote = ""
+    taker_2_base = ""
+    taker_2_quote = ""
 
     has_open_bid = False
     has_open_ask = False
@@ -74,11 +81,26 @@ class TriangularXEMM(ScriptStrategyBase):
             return
 
         # check for balances
-        self.check_target_balance()
+        balance_diff_base = self.get_target_balance_diff(self.maker_base, self.target_base_amount)
+        balance_diff_base_quantize = self.connector.quantize_order_amount(self.maker_pair, abs(balance_diff_base))
+
+        if balance_diff_base_quantize != Decimal("0"):
+            self.status = "HEDGE_MODE"
+            self.log_with_clock(logging.INFO, f"Hedging mode started")
+            balance_diff_quote = self.get_target_balance_diff(self.maker_quote, self.target_quote_amount)
+            if balance_diff_base > 0:
+                # bid was filled
+                taker_orders = self.get_taker_order_data(True, abs(balance_diff_base), abs(balance_diff_quote))
+            else:
+                # ask was filled
+                taker_orders = self.get_taker_order_data(False, abs(balance_diff_base), abs(balance_diff_quote))
+            self.place_taker_orders(taker_orders)
 
         # open maker orders
-        self.taker_sell_price = self.calculate_taker_price(self.taker_order_sides["maker_bid_filled"])
-        self.taker_buy_price = self.calculate_taker_price(self.taker_order_sides["maker_ask_filled"])
+        self.taker_sell_price = self.calculate_taker_price(is_maker_bid=True)
+        self.log_with_clock(logging.INFO, f"self.taker_sell_price = {self.taker_sell_price }")
+        self.taker_buy_price = self.calculate_taker_price(is_maker_bid=False)
+        self.log_with_clock(logging.INFO, f"self.taker_buy_price = {self.taker_buy_price}")
 
         self.check_and_cancel_open_orders()
         self.place_maker_orders()
@@ -88,105 +110,80 @@ class TriangularXEMM(ScriptStrategyBase):
         Initializes strategy once before the start.
         """
         self.status = "ACTIVE"
-        self.set_trading_pair()
-        self.set_order_side()
-        self.set_taker_price_calculation_method()
+        self.set_base_quote_assets()
         self.set_spread()
-        
-    # def check_trading_pair(self):
-    #     """
-    #     Checks if the pairs specified in the config are suitable for the triangular xemm.
-    #     They should have only 3 common assets.
-    #     """
-    #     self.maker_base, self.maker_quote = split_hb_trading_pair(self.maker_pair)
-    #     self.taker_1_base, self.taker_1_quote = split_hb_trading_pair(self.taker_pair_1)
-    #     self.taker_2_base, self.taker_2_quote = split_hb_trading_pair(self.taker_pair_2)
-    #     all_assets = {self.maker_base, self.maker_quote,
-    #                   self.taker_1_base, self.taker_1_quote,
-    #                   self.taker_2_base, self.taker_2_quote}
-    #     if len(all_assets) != 3:
-    #         self.status = "NOT_ACTIVE"
-    #         self.log_with_clock(logging.WARNING, f"Pairs {self.maker_pair}, {self.taker_pair_1}, {self.taker_pair_2} "
-    #                                              f"are not suited for triangular arbitrage!")
 
-    def set_trading_pair(self):
+    def set_base_quote_assets(self):
         """
-        Rearrange taker trading pairs so when ask or bid on maker market filled we start hedging by selling the
-        asset we have.
-        Makes 2 tuples for "bid_filled" and "ask_filled" directions and assigns them to the corresponding dictionary.
         """
-        maker_base, maker_quote = split_hb_trading_pair(self.maker_pair)
-        if maker_base in self.taker_pair_1:
-            self.taker_pairs = (self.taker_pair_1, self.taker_pair_2)
-        else:
-            self.taker_pairs = (self.taker_pair_2, self.taker_pair_1)
-
-    def set_order_side(self):
-        """
-        Sets order sides (1 = buy, 0 = sell) for already ordered trading pairs.
-        Makes 2 tuples for "bid_filled" and "ask_filled" directions and assigns them to the corresponding dictionary.
-        """
-        maker_base, maker_quote = split_hb_trading_pair(self.maker_pair)
-        taker_1_base, taker_1_quote = split_hb_trading_pair(self.taker_pairs[0])
-        taker_2_base, taker_2_quote = split_hb_trading_pair(self.taker_pairs[1])
-
-        order_side_1 = 0 if maker_base == taker_1_base else 1
-        order_side_2 = 0 if maker_quote == taker_2_quote else 1
-
-        self.taker_order_sides["maker_bid_filled"] = (order_side_1, order_side_2)
-        self.taker_order_sides["maker_ask_filled"] = (1 - order_side_1, 1 - order_side_2)
-
-    def set_taker_price_calculation_method(self):
-        taker_side_1, taker_side_2 = self.taker_order_sides["maker_bid_filled"][0], self.taker_order_sides["maker_bid_filled"][1]
-        if taker_side_1 == taker_side_2:
-            self.taker_price_calculation_method = 1
-        else:
-            self.taker_price_calculation_method = 2 if taker_side_2 else 3
+        self.maker_base, self.maker_quote = split_hb_trading_pair(self.maker_pair)
+        self.taker_1_base, self.taker_1_quote = split_hb_trading_pair(self.taker_pair_1)
+        self.taker_2_base, self.taker_2_quote = split_hb_trading_pair(self.taker_pair_2)
 
     def set_spread(self):
         self.spread = (self.min_spread + self.max_spread) / 2
 
-    def check_target_balance(self):
-        pass
-        # current_maker_base_balance = self.connector.get_available_balance(self.maker_base)
-        # amount_diff = current_maker_base_balance - self.target_amount
-        # amount_diff_quantize = self.connector.quantize_order_amount(self.maker_pair, Decimal(amount_diff))
-        # self.log_with_clock(logging.INFO, f"Current balance: {current_maker_base_balance}, "
-        #                                   f"Target balance: {self.target_amount}, "
-        #                                   f"amount_diff_quantize: {amount_diff_quantize}")
-        # if amount_diff_quantize == Decimal("0"):
-        #     return True
-        # else:
-        #     # get min_order_size on taker market
-        #     min_order_size_taker_1 = self.connector()
-        #     min_order_size_taker_2 = self.connector()
-        #     if both > 0:
-        #         filled_side = "bid_filled" if amount_diff > 0 else "ask_filled"
-        #         self.log_with_clock(logging.INFO, f"Hedging mode started")
-        #         self.status = "HEDGE_MODE"
-        #         self.create_and_process_taker_order_candidates(filled_side, amount_diff_quantize)
+    def get_target_balance_diff(self, asset, target_amount):
+        current_balance = self.connector.get_available_balance(asset)
+        amount_diff = current_balance - target_amount
+        self.log_with_clock(logging.INFO, f"Current balance {asset}: {current_balance}, "
+                                          f"Target balance: {target_amount}, "
+                                          f"Amount_diff: {amount_diff}")
+        return amount_diff
+
+    def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
+        taker_side_1 = not is_maker_bid
+        taker_amount_1 = balances_diff_base
+        taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1, taker_amount_1).result_price
+        if self.taker_1_quote == self.taker_2_quote:
+            taker_side_2 = True
+            taker_amount_2 = self.connector.quantize_order_amount(self.taker_pair_2, balances_diff_quote)
+        else:
+            taker_side_2 = False
+            taker_amount_2 = self.get_base_volume_for_quote_amount(self.taker_pair_2, False, balances_diff_quote)
+        taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2, taker_amount_2).result_price
+
+        return {"pair": [self.taker_pair_1, self.taker_pair_2],
+                "side": [taker_side_1, taker_side_2],
+                "amount": [taker_amount_1, taker_amount_2],
+                "price": [taker_price_1, taker_price_2]}
+
+    def place_taker_orders(self, taker_order):
+        order_candidate_adjusted = []
+        for i in range(2):
+            side = TradeType.BUY if taker_order["side"][i] else TradeType.SELL
+            order_candidate = OrderCandidate(
+                                    trading_pair=taker_order["pair"][i],
+                                    is_maker=False,
+                                    order_type=OrderType.MARKET,
+                                    order_side=side,
+                                    amount=taker_order["amount"][i],
+                                    price=taker_order["price"][i])
+            order_candidate_adjusted.append(self.connector.budget_checker.adjust_candidate(order_candidate[i],
+                                                                                           all_or_none=False))
+            if order_candidate_adjusted[i].amount < 0:
+                self.log_with_clock(logging.INFO, f"Order candidate amount is less than allowed on the market: "
+                                                  f" {order_candidate}")
+                return
+
+        self.log_with_clock(logging.INFO, f"Placing taker orders {order_candidate_adjusted}")
+        for order_candidate in order_candidate_adjusted:
+            self.place_order(order_candidate)
 
     def place_maker_orders(self):
         if not self.has_open_bid:
             order_price = self.taker_sell_price * Decimal(1 - self.spread / 100)
-            buy_candidate = OrderCandidate(
-                                trading_pair=self.maker_pair,
-                                is_maker=True,
-                                order_type=OrderType.LIMIT,
-                                order_side=TradeType.BUY,
-                                amount=self.order_amount,
-                                price=order_price)
+            buy_candidate = OrderCandidate(trading_pair=self.maker_pair,
+                                           is_maker=True,
+                                           order_type=OrderType.LIMIT,
+                                           order_side=TradeType.BUY,
+                                           amount=self.order_amount,
+                                           price=order_price)
             buy_candidate_adjusted = self.connector.budget_checker.adjust_candidate(buy_candidate, all_or_none=False)
             if buy_candidate_adjusted.amount > 0:
                 self.log_with_clock(logging.INFO, f"Buy {buy_candidate_adjusted.amount} {self.maker_pair} "
                                                   f"with the price {buy_candidate_adjusted.price}")
-                self.buy(
-                    self.connector_name,
-                    self.maker_pair,
-                    buy_candidate_adjusted.amount,
-                    buy_candidate_adjusted.order_type,
-                    buy_candidate_adjusted.price)
-                self.has_open_bid = True
+                self.place_order(buy_candidate_adjusted)
 
         if not self.has_open_ask:
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
@@ -201,34 +198,34 @@ class TriangularXEMM(ScriptStrategyBase):
             if sell_candidate_adjusted.amount > 0:
                 self.log_with_clock(logging.INFO, f"Sell {sell_candidate_adjusted.amount} {self.maker_pair} "
                                                   f"with the price {sell_candidate_adjusted.price}")
-                self.sell(
-                    self.connector_name,
-                    self.maker_pair,
-                    sell_candidate_adjusted.amount,
-                    sell_candidate_adjusted.order_type,
-                    sell_candidate_adjusted.price)
-                self.has_open_ask = True
+                self.place_order(sell_candidate_adjusted)
 
-    def calculate_taker_price(self, order_sides):
-        taker_1_price = self.connector.get_price(self.taker_pair_1, order_sides[0])
-        taker_1_price_ = self.connector.get_price(self.taker_pair_1, 1 - order_sides[0])
-        taker_2_price = self.connector.get_price(self.taker_pair_2, order_sides[1])
-        taker_2_price_ = self.connector.get_price(self.taker_pair_2, 1 - order_sides[1])
-        maker_price_bid_ = self.connector.get_price(self.maker_pair, False)
-        maker_price_ask_ = self.connector.get_price(self.maker_pair, True)
-        if self.taker_price_calculation_method == 1:
-            taker_price = taker_1_price * taker_2_price
-        elif self.taker_price_calculation_method == 2:
-            taker_price = taker_1_price / taker_2_price
+    def place_order(self, candidate):
+        if candidate.order_side == TradeType.BUY:
+            self.buy(
+                self.connector_name, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
         else:
-            taker_price = taker_2_price / taker_1_price
-        return taker_price
+            self.sell(
+                self.connector_name, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
+
+    def calculate_taker_price(self, is_maker_bid):
+        side_taker_1 = not is_maker_bid
+        exchanged_amount_1 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_1, side_taker_1, self.order_amount).result_volume
+        if self.taker_1_quote == self.taker_2_quote:
+            side_taker_2 = not side_taker_1
+            exchanged_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, side_taker_2, exchanged_amount_1)
+        else:
+            side_taker_2 = side_taker_1
+            exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_2, side_taker_2, exchanged_amount_1).result_volume
+        final_price = exchanged_amount_2 / self.order_amount
+        return final_price
 
     def check_and_cancel_open_orders(self):
         self.has_open_bid = False
         self.has_open_ask = False
         for order in self.get_active_orders(connector_name=self.connector_name):
             if order.is_buy:
+                self.has_open_bid = True
                 upper_price = self.taker_sell_price * Decimal(1 - self.min_spread / 100)
                 lower_price = self.taker_sell_price * Decimal(1 - self.max_spread / 100)
                 self.log_with_clock(logging.INFO, f"BUY order price {order.price} Range:"
@@ -237,9 +234,9 @@ class TriangularXEMM(ScriptStrategyBase):
                     self.log_with_clock(logging.INFO, f"BUY order price {order.price} is not in the range "
                                                       f"{lower_price} - {upper_price}. Cancelling order.")
                     self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
-                else:
-                    self.has_open_bid = True
+                    self.has_open_bid = False
             else:
+                self.has_open_ask = True
                 upper_price = self.taker_buy_price * Decimal(1 + self.max_spread / 100)
                 lower_price = self.taker_buy_price * Decimal(1 + self.min_spread / 100)
                 self.log_with_clock(logging.INFO, f"SELL order price {order.price} Range:"
@@ -248,5 +245,29 @@ class TriangularXEMM(ScriptStrategyBase):
                     self.log_with_clock(logging.INFO, f"SELL order price {order.price} is not in the range "
                                                       f"{lower_price} - {upper_price}. Cancelling order.")
                     self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
-                else:
-                    self.has_open_ask = True
+                    self.has_open_ask = False
+
+    def get_base_amount_for_quote_volume(self, pair, side, quote_volume) -> Decimal:
+        """
+        Calculates base amount that you get for the quote volume using the orderbook entries
+        """
+        orderbook = self.connector.get_order_book(pair)
+        orderbook_entries = orderbook.ask_entries() if side else orderbook.bid_entries()
+
+        cumulative_volume = 0.
+        cumulative_base_amount = 0.
+        quote_volume = float(quote_volume)
+
+        for order_book_row in orderbook_entries:
+            row_amount = order_book_row.amount
+            row_price = order_book_row.price
+            row_volume = row_amount * row_price
+            if row_volume + cumulative_volume >= quote_volume:
+                row_volume = quote_volume - cumulative_volume
+                row_amount = row_volume / row_price
+            cumulative_volume += row_volume
+            cumulative_base_amount += row_amount
+            if cumulative_volume >= quote_volume:
+                break
+
+        return Decimal(cumulative_base_amount)
