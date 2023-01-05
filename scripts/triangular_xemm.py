@@ -21,15 +21,15 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_pair_1: str = "FRONT-USDT"
     taker_pair_2: str = "BTC-USDT"
 
-    min_spread: Decimal = Decimal("0.1")
-    max_spread: Decimal = Decimal("0.5")
+    min_spread: Decimal = Decimal("0.3")
+    max_spread: Decimal = Decimal("0.6")
 
-    order_amount: Decimal = Decimal("800")
+    order_amount: Decimal = Decimal("1000")
     target_base_amount = Decimal("0")
     target_quote_amount = Decimal("0.016893")
     order_delay = 60
     # min_order_amount = Decimal("1")
-    # slippage_buffer = Decimal("1")
+    slippage_buffer = Decimal("1")
 
     # kill_switch_enabled: bool = True
     # kill_switch_rate = Decimal("-2")
@@ -150,7 +150,7 @@ class TriangularXEMM(ScriptStrategyBase):
             msg = f"Arbitrage round completed"
             self.notify_hb_app_with_timestamp(msg)
             self.log_with_clock(logging.WARNING, msg)
-            self.status = "ACTIVE"
+            self.status = "NOT_ACTIVE"
 
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
@@ -161,9 +161,13 @@ class TriangularXEMM(ScriptStrategyBase):
         return amount_diff
 
     def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
+        slippage_buy = Decimal(1 + self.slippage_buffer / 100)
+        slippage_sell = Decimal(1 - self.slippage_buffer / 100)
+
         taker_side_1 = not is_maker_bid
         taker_amount_1 = balances_diff_base
         taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1, taker_amount_1).result_price
+        taker_price_1 = taker_price_1 * slippage_buy if taker_side_1 else taker_price_1 * slippage_sell
         if self.taker_1_quote == self.taker_2_quote:
             taker_side_2 = True
             taker_amount_2 = self.connector.quantize_order_amount(self.taker_pair_2, balances_diff_quote)
@@ -171,6 +175,7 @@ class TriangularXEMM(ScriptStrategyBase):
             taker_side_2 = False
             taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, False, balances_diff_quote)
         taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2, taker_amount_2).result_price
+        taker_price_2 = taker_price_2 * slippage_buy if taker_side_2 else taker_price_2 * slippage_sell
 
         return {"pair": [self.taker_pair_1, self.taker_pair_2],
                 "side": [taker_side_1, taker_side_2],
@@ -191,7 +196,7 @@ class TriangularXEMM(ScriptStrategyBase):
             taker_candidate = OrderCandidate(
                                     trading_pair=taker_order["pair"][i],
                                     is_maker=False,
-                                    order_type=OrderType.MARKET,
+                                    order_type=OrderType.LIMIT,
                                     order_side=side,
                                     amount=taker_order["amount"][i],
                                     price=taker_order["price"][i])
