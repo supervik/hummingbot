@@ -1,18 +1,11 @@
 import logging
-import math
 
 import pandas as pd
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import (
-    BuyOrderCompletedEvent,
-    BuyOrderCreatedEvent,
-    MarketOrderFailureEvent,
-    SellOrderCompletedEvent,
-    SellOrderCreatedEvent, OrderFilledEvent,
-)
+from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent
 from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
 
 
@@ -24,7 +17,7 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_pair_2: str = "BTC-USDT"
 
     min_spread: Decimal = Decimal("0.3")
-    max_spread: Decimal = Decimal("0.6")
+    max_spread: Decimal = Decimal("0.5")
 
     order_amount: Decimal = Decimal("1000")
     target_base_amount = Decimal("0")
@@ -107,10 +100,10 @@ class TriangularXEMM(ScriptStrategyBase):
         if self.check_and_cancel_maker_orders():
             return True
         self.place_maker_orders()
-        
+
     def init_strategy(self):
         """
-        Initializes strategy once before the start.
+        Initializes strategy once before the start
         """
         self.status = "ACTIVE"
         self.set_base_quote_assets()
@@ -149,17 +142,17 @@ class TriangularXEMM(ScriptStrategyBase):
                     delay = candidate['sent_timestamp'] + self.place_order_trials_delay - self.current_timestamp
                     self.log_with_clock(logging.INFO, f"Too early to place an order. Try again. {delay} sec left.")
         else:
-            msg = f"Arbitrage round completed"
+            msg = "Arbitrage round completed"
             self.notify_hb_app_with_timestamp(msg)
             self.log_with_clock(logging.WARNING, msg)
-            self.status = "NOT_ACTIVE"
+            self.status = "ACTIVE"
 
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
         amount_diff = current_balance - target_amount
-        self.log_with_clock(logging.INFO, f"Current balance {asset}: {current_balance}, "
-                                          f"Target balance: {target_amount}, "
-                                          f"Amount_diff: {amount_diff}")
+        # self.log_with_clock(logging.INFO, f"Current balance {asset}: {current_balance}, "
+        #                                   f"Target balance: {target_amount}, "
+        #                                   f"Amount_diff: {amount_diff}")
         return amount_diff
 
     def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
@@ -176,6 +169,7 @@ class TriangularXEMM(ScriptStrategyBase):
         else:
             taker_side_2 = False
             taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, False, balances_diff_quote)
+            taker_amount_2 = self.connector.quantize_order_amount(self.taker_pair_2, taker_amount_2)
         taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2, taker_amount_2).result_price
         taker_price_2 = taker_price_2 * slippage_buy if taker_side_2 else taker_price_2 * slippage_sell
 
@@ -186,7 +180,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def place_taker_orders(self, taker_order):
         self.status = "HEDGE_MODE"
-        self.log_with_clock(logging.INFO, f"Hedging mode started")
+        self.log_with_clock(logging.INFO, "Hedging mode started")
         self.last_order_timestamp = self.current_timestamp
         self.cancel_all_orders()
         for i in range(2):
@@ -225,7 +219,6 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def place_maker_orders(self):
         if not self.has_open_bid:
-            self.log_with_clock(logging.INFO, f"Placing maker BUY order")
             order_price = self.taker_sell_price * Decimal(1 - self.spread / 100)
             buy_candidate = OrderCandidate(trading_pair=self.maker_pair,
                                            is_maker=True,
@@ -233,7 +226,9 @@ class TriangularXEMM(ScriptStrategyBase):
                                            order_side=TradeType.BUY,
                                            amount=self.order_amount,
                                            price=order_price)
-            self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
+            place_result = self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
+            if place_result:
+                self.log_with_clock(logging.INFO, "Placed maker BUY order")
             # buy_candidate_adjusted = self.connector.budget_checker.adjust_candidate(buy_candidate, all_or_none=False)
             # if buy_candidate_adjusted.amount > Decimal("0"):
             #     self.place_order(buy_candidate_adjusted)
@@ -242,7 +237,6 @@ class TriangularXEMM(ScriptStrategyBase):
             #                                       f"{self.maker_pair} Can't place order.")
 
         if not self.has_open_ask:
-            self.log_with_clock(logging.INFO, f"Placing maker SELL order")
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
             sell_candidate = OrderCandidate(
                 trading_pair=self.maker_pair,
@@ -251,7 +245,9 @@ class TriangularXEMM(ScriptStrategyBase):
                 order_side=TradeType.SELL,
                 amount=self.order_amount,
                 price=order_price)
-            self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
+            place_result = self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
+            if place_result:
+                self.log_with_clock(logging.INFO, "Placed maker SELL order")
             # sell_candidate_adjusted = self.connector.budget_checker.adjust_candidate(sell_candidate, all_or_none=False)
             # if sell_candidate_adjusted.amount > Decimal("0"):
             #     self.place_order(sell_candidate_adjusted)
@@ -262,11 +258,12 @@ class TriangularXEMM(ScriptStrategyBase):
     def adjust_and_place_order(self, candidate, all_or_none):
         candidate_adjusted = self.connector.budget_checker.adjust_candidate(candidate, all_or_none=all_or_none)
         if candidate_adjusted.amount == Decimal("0"):
-            self.log_with_clock(logging.INFO,
-                                f"Order candidate amount is less than allowed on the market: "
-                                f" {candidate_adjusted.trading_pair}. Can't create"
-                                f" {candidate_adjusted.order_side.name}"
-                                f" {candidate_adjusted.order_type.name} order")
+            if candidate_adjusted.trading_pair != self.maker_pair:
+                self.log_with_clock(logging.INFO,
+                                    f"Order candidate amount is less than allowed on the market: "
+                                    f" {candidate_adjusted.trading_pair}. Can't create"
+                                    f" {candidate_adjusted.order_side.name}"
+                                    f" {candidate_adjusted.order_type.name} order")
             return False
         else:
             self.place_order(candidate_adjusted)
