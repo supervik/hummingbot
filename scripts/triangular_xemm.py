@@ -1,6 +1,8 @@
 import logging
 import math
 
+import pandas as pd
+
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
@@ -375,3 +377,61 @@ class TriangularXEMM(ScriptStrategyBase):
                 self.log_with_clock(logging.INFO, f"Remove order candidate {candidate}")
                 self.taker_candidates.pop(i)
                 break
+
+    def active_orders_df(self) -> pd.DataFrame:
+        """
+        Returns a custom data frame of all active maker orders for display purposes
+        """
+        columns = ["Market", "Pair", "Side", "Price", "Size", "Min price", "Max price", "Spread", "Age"]
+        data = []
+        mid_price = self.connector.get_mid_price(self.maker_pair)
+        for connector_name, connector in self.connectors.items():
+            for order in self.get_active_orders(connector_name):
+                if order.is_buy:
+                    upper_price = self.taker_sell_price * Decimal(1 - self.min_spread / 100)
+                    lower_price = self.taker_sell_price * Decimal(1 - self.max_spread / 100)
+                    spread_mid = (mid_price - order.price) / mid_price * 100
+                else:
+                    upper_price = self.taker_buy_price * Decimal(1 + self.max_spread / 100)
+                    lower_price = self.taker_buy_price * Decimal(1 + self.min_spread / 100)
+                    spread_mid = (order.price - mid_price) / mid_price * 100
+
+                age_txt = "n/a" if order.age() <= 0. else pd.Timestamp(order.age(), unit='s').strftime('%H:%M:%S')
+                data.append([
+                    self.connector_name,
+                    order.trading_pair,
+                    "buy" if order.is_buy else "sell",
+                    float(order.price),
+                    float(order.quantity),
+                    float(lower_price),
+                    float(upper_price),
+                    float(round(spread_mid, 2)),
+                    age_txt
+                ])
+        if not data:
+            raise ValueError
+        df = pd.DataFrame(data=data, columns=columns)
+        df.sort_values(by=["Market", "Side"], inplace=True)
+        return df
+
+    def format_status(self) -> str:
+        """
+        Returns status of the current strategy on user balances and current active orders. This function is called
+        when status command is issued. Override this function to create custom status display output.
+        """
+        if not self.ready_to_trade:
+            return "Market connectors are not ready."
+        lines = []
+
+        lines.extend(["", "  Strategy status:"] + ["    " + self.status])
+
+        balance_df = self.get_balance_df()
+        lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
+
+        try:
+            orders_df = self.active_orders_df()
+            lines.extend(["", "  Active Orders:"] + ["    " + line for line in orders_df.to_string(index=False).split("\n")])
+        except ValueError:
+            lines.extend(["", "  No active maker orders."])
+
+        return "\n".join(lines)
