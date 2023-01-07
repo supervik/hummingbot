@@ -156,22 +156,18 @@ class TriangularXEMM(ScriptStrategyBase):
         return amount_diff
 
     def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
-        slippage_buy = Decimal(1 + self.slippage_buffer / 100)
-        slippage_sell = Decimal(1 - self.slippage_buffer / 100)
-
         taker_side_1 = not is_maker_bid
         taker_amount_1 = balances_diff_base
         taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1, taker_amount_1).result_price
-        taker_price_1 = taker_price_1 * slippage_buy if taker_side_1 else taker_price_1 * slippage_sell
+
         if self.taker_1_quote == self.taker_2_quote:
-            taker_side_2 = True
-            taker_amount_2 = self.connector.quantize_order_amount(self.taker_pair_2, balances_diff_quote)
+            taker_side_2 = True if is_maker_bid else False
+            taker_amount_2 = balances_diff_quote
         else:
-            taker_side_2 = False
+            taker_side_2 = False if is_maker_bid else True
             taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, False, balances_diff_quote)
-            taker_amount_2 = self.connector.quantize_order_amount(self.taker_pair_2, taker_amount_2)
+
         taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2, taker_amount_2).result_price
-        taker_price_2 = taker_price_2 * slippage_buy if taker_side_2 else taker_price_2 * slippage_sell
 
         return {"pair": [self.taker_pair_1, self.taker_pair_2],
                 "side": [taker_side_1, taker_side_2],
@@ -183,39 +179,32 @@ class TriangularXEMM(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, "Hedging mode started")
         self.last_order_timestamp = self.current_timestamp
         self.cancel_all_orders()
+
         for i in range(2):
-            side = TradeType.BUY if taker_order["side"][i] else TradeType.SELL
-            if taker_order["amount"][i] <= Decimal("0"):
+            amount = self.connector.quantize_order_amount(taker_order["pair"][i], taker_order["amount"][i])
+            if amount <= Decimal("0"):
                 self.log_with_clock(logging.INFO, f"Can't add taker candidate {side} {taker_order['pair'][i]} "
                                                   f"to the list. Too low amount")
                 continue
+            if taker_order["side"][i]:
+                side = TradeType.BUY
+                price = taker_order["price"][i] * Decimal(1 + self.slippage_buffer / 100)
+            else:
+                side = TradeType.SELL
+                price = taker_order["price"][i] * Decimal(1 - self.slippage_buffer / 100)
+
             taker_candidate = OrderCandidate(
                                     trading_pair=taker_order["pair"][i],
                                     is_maker=False,
                                     order_type=OrderType.LIMIT,
                                     order_side=side,
-                                    amount=taker_order["amount"][i],
-                                    price=taker_order["price"][i])
+                                    amount=amount,
+                                    price=price)
             self.taker_candidates.append({"order_candidate": taker_candidate, "sent_timestamp": 0, "trials": 0})
             sent_result = self.adjust_and_place_order(candidate=taker_candidate, all_or_none=True)
             if sent_result:
                 self.taker_candidates[-1]["sent_timestamp"] = self.current_timestamp
             self.log_with_clock(logging.INFO, f"New taker candidate added to the list: {self.taker_candidates[-1]}")
-
-            # order_candidate_adjusted = self.connector.budget_checker.adjust_candidate(order_candidate, all_or_none=True)
-            # if order_candidate_adjusted.amount == Decimal("0"):
-            #     self.log_with_clock(logging.INFO, f"Order candidate amount is less than allowed on the market: "
-            #                                       f" {order_candidate_adjusted.trading_pair}. Can't create"
-            #                                       f" {order_candidate_adjusted.order_side.name}"
-            #                                       f" {order_candidate_adjusted.order_type.name} order")
-            #     self.taker_candidates.append({"order_candidate": order_candidate,
-            #                                   "sent_timestamp": 0,
-            #                                   "trials": 0})
-            # else:
-            #     self.taker_candidates.append({"order_candidate": order_candidate,
-            #                                   "sent_timestamp": self.current_timestamp,
-            #                                   "trials": 0})
-            #     self.place_order(order_candidate_adjusted)
 
     def place_maker_orders(self):
         if not self.has_open_bid:
@@ -229,12 +218,6 @@ class TriangularXEMM(ScriptStrategyBase):
             place_result = self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
             if place_result:
                 self.log_with_clock(logging.INFO, "Placed maker BUY order")
-            # buy_candidate_adjusted = self.connector.budget_checker.adjust_candidate(buy_candidate, all_or_none=False)
-            # if buy_candidate_adjusted.amount > Decimal("0"):
-            #     self.place_order(buy_candidate_adjusted)
-            # else:
-            #     self.log_with_clock(logging.INFO, f"BUY amount is less than allowed on the maker market"
-            #                                       f"{self.maker_pair} Can't place order.")
 
         if not self.has_open_ask:
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
