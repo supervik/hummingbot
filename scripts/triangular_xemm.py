@@ -11,17 +11,18 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 class TriangularXEMM(ScriptStrategyBase):
     # Config params
-    connector_name: str = "kucoin"
-    maker_pair: str = "FRONT-BTC"
-    taker_pair_1: str = "FRONT-USDT"
-    taker_pair_2: str = "BTC-USDT"
+    connector_name: str = "binance"
+    maker_pair: str = "RLC-ETH"
+    taker_pair_1: str = "RLC-USDT"
+    taker_pair_2: str = "ETH-USDT"
 
-    min_spread: Decimal = Decimal("0.3")
-    max_spread: Decimal = Decimal("0.5")
+    min_spread: Decimal = Decimal("0.4")
+    max_spread: Decimal = Decimal("0.8")
 
-    order_amount: Decimal = Decimal("1000")
+    order_amount: Decimal = Decimal("22")
+    set_target_from_balances = False
     target_base_amount = Decimal("0")
-    target_quote_amount = Decimal("0.016893")
+    target_quote_amount = Decimal("0.06")
     order_delay = 60
     # min_order_amount = Decimal("1")
     slippage_buffer = Decimal("1")
@@ -37,12 +38,7 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_sell_price = 0
     taker_buy_price = 0
     spread = 0
-    maker_base = ""
-    maker_quote = ""
-    taker_1_base = ""
-    taker_1_quote = ""
-    taker_2_base = ""
-    taker_2_quote = ""
+    assets = {}
 
     has_open_bid = False
     has_open_ask = False
@@ -76,11 +72,11 @@ class TriangularXEMM(ScriptStrategyBase):
             return
 
         # check for balances
-        balance_diff_base = self.get_target_balance_diff(self.maker_base, self.target_base_amount)
+        balance_diff_base = self.get_target_balance_diff(self.assets["maker_base"], self.target_base_amount)
         balance_diff_base_quantize = self.connector.quantize_order_amount(self.taker_pair_1, abs(balance_diff_base))
 
         if balance_diff_base_quantize != Decimal("0"):
-            balance_diff_quote = self.get_target_balance_diff(self.maker_quote, self.target_quote_amount)
+            balance_diff_quote = self.get_target_balance_diff(self.assets["maker_quote"], self.target_quote_amount)
             if balance_diff_base > 0:
                 # bid was filled
                 taker_orders = self.get_taker_order_data(True, abs(balance_diff_base), abs(balance_diff_quote))
@@ -98,26 +94,45 @@ class TriangularXEMM(ScriptStrategyBase):
         # self.log_with_clock(logging.INFO, f"self.taker_buy_price = {self.taker_buy_price}")
 
         if self.check_and_cancel_maker_orders():
-            return True
+            return
         self.place_maker_orders()
 
     def init_strategy(self):
         """
         Initializes strategy once before the start
         """
+        self.notify_hb_app_with_timestamp("Strategy started")
         self.status = "ACTIVE"
         self.set_base_quote_assets()
         self.set_spread()
+        self.set_target_amounts()
 
     def set_base_quote_assets(self):
         """
         """
-        self.maker_base, self.maker_quote = split_hb_trading_pair(self.maker_pair)
-        self.taker_1_base, self.taker_1_quote = split_hb_trading_pair(self.taker_pair_1)
-        self.taker_2_base, self.taker_2_quote = split_hb_trading_pair(self.taker_pair_2)
+        self.assets["maker_base"], self.assets["maker_quote"] = split_hb_trading_pair(self.maker_pair)
+        self.assets["taker_1_base"], self.assets["taker_1_quote"] = split_hb_trading_pair(self.taker_pair_1)
+        self.assets["taker_2_base"], self.assets["taker_2_quote"] = split_hb_trading_pair(self.taker_pair_2)
 
     def set_spread(self):
         self.spread = (self.min_spread + self.max_spread) / 2
+
+    def set_target_amounts(self):
+        if self.set_target_from_balances:
+            self.notify_hb_app_with_timestamp(f"Setting target amounts from balances")
+            self.target_base_amount = self.connector.get_balance(self.assets["maker_base"])
+            self.target_quote_amount = self.connector.get_balance(self.assets["maker_quote"])
+        else:
+            self.notify_hb_app_with_timestamp(f"Setting target amounts from config")
+            balance_diff_base = self.get_target_balance_diff(self.assets["maker_base"], self.target_base_amount)
+            balance_diff_base_quantize = self.connector.quantize_order_amount(self.taker_pair_1, abs(balance_diff_base))
+            if balance_diff_base_quantize != Decimal("0"):
+                self.notify_hb_app_with_timestamp(f"Target balances doesn't match. Rebalance in {self.order_delay} sec")
+                self.last_order_timestamp = self.current_timestamp
+        msg = f"Target base amount: {self.target_base_amount} {self.assets['maker_base']}, " \
+              f"Target quote amount: {self.target_quote_amount} {self.assets['maker_quote']}"
+        self.log_with_clock(logging.INFO, msg)
+        self.notify_hb_app_with_timestamp(msg)
 
     def process_hedge(self):
         if len(self.taker_candidates) > 0:
@@ -158,21 +173,25 @@ class TriangularXEMM(ScriptStrategyBase):
     def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
         taker_side_1 = not is_maker_bid
         taker_amount_1 = balances_diff_base
-        taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1, taker_amount_1).result_price
+        taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1,
+                                                            taker_amount_1).result_price
 
-        if self.taker_1_quote == self.taker_2_quote:
+        if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
             taker_side_2 = True if is_maker_bid else False
             taker_amount_2 = balances_diff_quote
         else:
             taker_side_2 = False if is_maker_bid else True
             taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, False, balances_diff_quote)
 
-        taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2, taker_amount_2).result_price
+        taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2,
+                                                            taker_amount_2).result_price
 
-        return {"pair": [self.taker_pair_1, self.taker_pair_2],
-                "side": [taker_side_1, taker_side_2],
-                "amount": [taker_amount_1, taker_amount_2],
-                "price": [taker_price_1, taker_price_2]}
+        taker_orders_data = {"pair": [self.taker_pair_1, self.taker_pair_2],
+                             "side": [taker_side_1, taker_side_2],
+                             "amount": [taker_amount_1, taker_amount_2],
+                             "price": [taker_price_1, taker_price_2]}
+        self.log_with_clock(logging.INFO, f"taker_orders_data = {taker_orders_data}")
+        return taker_orders_data
 
     def place_taker_orders(self, taker_order):
         self.status = "HEDGE_MODE"
@@ -194,12 +213,12 @@ class TriangularXEMM(ScriptStrategyBase):
                 price = taker_order["price"][i] * Decimal(1 - self.slippage_buffer / 100)
 
             taker_candidate = OrderCandidate(
-                                    trading_pair=taker_order["pair"][i],
-                                    is_maker=False,
-                                    order_type=OrderType.LIMIT,
-                                    order_side=side,
-                                    amount=amount,
-                                    price=price)
+                trading_pair=taker_order["pair"][i],
+                is_maker=False,
+                order_type=OrderType.LIMIT,
+                order_side=side,
+                amount=amount,
+                price=price)
             self.taker_candidates.append({"order_candidate": taker_candidate, "sent_timestamp": 0, "trials": 0})
             sent_result = self.adjust_and_place_order(candidate=taker_candidate, all_or_none=True)
             if sent_result:
@@ -268,13 +287,16 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def calculate_taker_price(self, is_maker_bid):
         side_taker_1 = not is_maker_bid
-        exchanged_amount_1 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_1, side_taker_1, self.order_amount).result_volume
-        if self.taker_1_quote == self.taker_2_quote:
+        exchanged_amount_1 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_1, side_taker_1,
+                                                                             self.order_amount).result_volume
+        if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
             side_taker_2 = not side_taker_1
-            exchanged_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, side_taker_2, exchanged_amount_1)
+            exchanged_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, side_taker_2,
+                                                                       exchanged_amount_1)
         else:
             side_taker_2 = side_taker_1
-            exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_2, side_taker_2, exchanged_amount_1).result_volume
+            exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_2, side_taker_2,
+                                                                                 exchanged_amount_1).result_volume
         final_price = exchanged_amount_2 / self.order_amount
         # tests
         # test_price_taker_1_ask = self.connector.get_vwap_for_volume(self.taker_pair_1, True, self.order_amount).result_price
@@ -404,13 +426,16 @@ class TriangularXEMM(ScriptStrategyBase):
         lines = []
 
         lines.extend(["", "  Strategy status:"] + ["    " + self.status])
+        lines.extend(["", "  Target amounts:"] + ["    " + f"{self.target_base_amount} {self.assets['maker_base']} "
+                                                           f"{self.target_quote_amount} {self.assets['maker_quote']}"])
 
         balance_df = self.get_balance_df()
         lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
 
         try:
             orders_df = self.active_orders_df()
-            lines.extend(["", "  Active Orders:"] + ["    " + line for line in orders_df.to_string(index=False).split("\n")])
+            lines.extend(
+                ["", "  Active Orders:"] + ["    " + line for line in orders_df.to_string(index=False).split("\n")])
         except ValueError:
             lines.extend(["", "  No active maker orders."])
 
