@@ -19,21 +19,21 @@ class FetchTriPairs(ScriptStrategyBase):
 
     taker_pair_2: str = "ETH-USDT"
 
-    # follow_markets = [{"maker": "XMR-ETH", "taker": "XMR-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "SDAO-ETH", "taker": "SDAO-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "XRP-ETH", "taker": "XRP-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "TRX-ETH", "taker": "TRX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "FTM-ETH", "taker": "FTM-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "ALGO-ETH", "taker": "ALGO-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "KCS-ETH", "taker": "KCS-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "AGIX-ETH", "taker": "AGIX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "OCEAN-ETH", "taker": "OCEAN-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-    #                   {"maker": "ALICE-ETH", "taker": "ALICE-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0}
-    #                   ]
     follow_markets = [{"maker": "XMR-ETH", "taker": "XMR-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
-                      {"maker": "AGIX-ETH", "taker": "AGIX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0}
+                      {"maker": "SDAO-ETH", "taker": "SDAO-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "XRP-ETH", "taker": "XRP-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "TRX-ETH", "taker": "TRX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "FTM-ETH", "taker": "FTM-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "ALGO-ETH", "taker": "ALGO-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "KCS-ETH", "taker": "KCS-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "AGIX-ETH", "taker": "AGIX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "OCEAN-ETH", "taker": "OCEAN-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+                      {"maker": "ALICE-ETH", "taker": "ALICE-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0}
                       ]
-    min_profitability = 1
+    # follow_markets = [{"maker": "XMR-ETH", "taker": "XMR-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
+    #                   {"maker": "AGIX-ETH", "taker": "AGIX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0}
+    #                   ]
+    min_profitability = 0.8
     check_delay = 60
 
     markets = {connector_name: {trading_pair}}
@@ -82,10 +82,15 @@ class FetchTriPairs(ScriptStrategyBase):
         records = requests.get(url=self.url).json()
         records = records["data"]["ticker"]
         pairs_data = {}
-        for record in records:
-            pairs_data[record["symbol"]] = {"bid": Decimal(str(record["buy"])),
-                                            "ask": Decimal(str(record["sell"])),
-                                            "last": Decimal(str(record["last"]))}
+        try:
+            for record in records:
+                if record["buy"] and record["sell"] and record["last"]:
+                    pairs_data[record["symbol"]] = {"bid": Decimal(str(record["buy"])),
+                                                    "ask": Decimal(str(record["sell"])),
+                                                    "last": Decimal(str(record["last"]))}
+        except Exception as e:
+            self.log_with_clock(logging.INFO, f"Error in getting Request. record= {record}")
+            return None
         return pairs_data
 
     def find_cross_market(self, maker_quote, taker_quote, vol_maker_thrsh, vol_taker_thrsh):
@@ -105,6 +110,8 @@ class FetchTriPairs(ScriptStrategyBase):
     def on_tick(self):
         # self.log_with_clock(logging.INFO, "New tick")
         prices_updated = self.get_pairs_data()
+        if not prices_updated:
+            return
 
         taker_2 = self.taker_pair_2
         taker_2_bid = prices_updated[taker_2]['bid']
