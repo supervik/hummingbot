@@ -33,8 +33,12 @@ class FetchTriPairs(ScriptStrategyBase):
     # follow_markets = [{"maker": "XMR-ETH", "taker": "XMR-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
     #                   {"maker": "AGIX-ETH", "taker": "AGIX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0}
     #                   ]
-    min_profitability = 0.8
+    min_profitability = 2
     check_delay = 60
+
+    status = "NOT_INIT"
+    triangles = {}
+    pairs_data = {}
 
     markets = {connector_name: {trading_pair}}
 
@@ -46,7 +50,7 @@ class FetchTriPairs(ScriptStrategyBase):
         """
         return self.connectors[self.connector_name]
 
-    def get_pairs_data(self):
+    def get_api_data(self):
         """
         Fetches data and returns a list daily close
         This is the API response data structure:
@@ -73,87 +77,212 @@ class FetchTriPairs(ScriptStrategyBase):
                 }
             ]
         }
+        returns ticker list
+        """
+        records = requests.get(url=self.url).json()
+        if records["code"] != "200000":
+            return None
+        return records["data"]["ticker"]
+
+    def get_pairs_data(self):
+        """"
         returns dictionary in the structure:
         {
             "XMR-USDT": {"bid": 161.3, "ask": 165.4, "last": 163.8},
             "AGIX-USDT": {"bid": 0.391, "ask": 0.423, "last": 0.401}
         }
         """
-        records = requests.get(url=self.url).json()
-        records = records["data"]["ticker"]
-        pairs_data = {}
-        try:
-            for record in records:
-                if record["buy"] and record["sell"] and record["last"]:
-                    pairs_data[record["symbol"]] = {"bid": Decimal(str(record["buy"])),
-                                                    "ask": Decimal(str(record["sell"])),
-                                                    "last": Decimal(str(record["last"]))}
-        except Exception as e:
-            self.log_with_clock(logging.INFO, f"Error in getting Request. record= {record}")
-            return None
-        return pairs_data
+        records = self.get_api_data()
+        if not records:
+            return False
+        # try:
+        for record in records:
+            pair = record["symbol"]
+            if record["buy"] and record["sell"] and record["last"]:
+                if pair not in self.pairs_data:
+                    self.pairs_data[pair] = {}
 
-    def find_cross_market(self, maker_quote, taker_quote, vol_maker_thrsh, vol_taker_thrsh):
-        maker_market = {}
-        taker_market = {}
-        for d in data:
-            symbol = d['symbol']
-            base, quote = symbol.split('-')
-            volume_in_quote = float(d['volValue'])
-            if quote == maker_quote and volume_in_quote > vol_maker_thrsh:
-                maker_market[base] = volume_in_quote
-            elif quote == taker_quote and volume_in_quote > vol_taker_thrsh:
-                taker_market[base] = volume_in_quote
-        maker_market = {k: maker_market[k] for k in sorted(maker_market, key=maker_market.get, reverse=True)}
-        return [market for market in maker_market if market in taker_market]
+                self.pairs_data[pair]["bid"] = Decimal(str(record["buy"]))
+                self.pairs_data[pair]["ask"] = Decimal(str(record["sell"]))
+                self.pairs_data[pair]["last"] = Decimal(str(record["last"]))
+        return True
+
+
+        # except Exception as e:
+        #     self.log_with_clock(logging.INFO, f"Error in getting data. record= {record}, Exception: {e}")
+        #
+        #     return False
+        return True
+
+    def create_quoted_pairs(self):
+        """
+        creates dictionary or quoted pairs with the structure:
+        {
+            "ETH": ["ALGO", "ADA", "XMR"],
+            "BTC": ["ADA", "TRX", "ETH"],
+        }
+        """
+        records = self.get_api_data()
+        quoted_pairs = {}
+        if records:
+            for row in records:
+                base, quote = split_hb_trading_pair(row["symbol"])
+                if quote not in quoted_pairs:
+                    quoted_pairs[quote] = [base]
+                else:
+                    quoted_pairs[quote].append(base)
+        # self.log_with_clock(logging.INFO, f"Quoted pairs: {quoted_pairs}")
+        return quoted_pairs
+
+    def create_triangles(self):
+        """
+        Creates all avaialble triangles on the market in the structure:
+        {
+            "ETH-USDT": ["ADA", "ALGO", "TRX"],
+            "BTC-USDT": ["XEM", "XRP"]
+        }
+        """
+        quoted_pairs = self.create_quoted_pairs()
+        quoted_pairs_copy = dict(quoted_pairs)
+        for quote_asset, base_assets in quoted_pairs.items():
+            # self.log_with_clock(logging.INFO, f"Iterating. New row: {quote_asset}: {base_assets}")
+            quoted_pairs_copy.pop(quote_asset, None)
+            if quoted_pairs_copy:
+                for base_asset in base_assets:
+                    for quote_asset_next, base_assets_next in quoted_pairs_copy.items():
+                        if base_asset in base_assets_next:
+                            if quote_asset in base_assets_next:
+                                main_pair = f"{quote_asset}-{quote_asset_next}"
+                            elif quote_asset_next in base_assets:
+                                main_pair = f"{quote_asset_next}-{quote_asset}"
+                            else:
+                                self.log_with_clock(logging.INFO, f"No pair exist for {quote_asset} and {quote_asset_next}")
+                                continue
+                            if main_pair in self.triangles:
+                                self.triangles[main_pair].append(base_asset)
+                            else:
+                                self.triangles[main_pair] = [base_asset]
+        self.log_with_clock(logging.INFO, f"self.triangles {self.triangles}")
+        pairs_number = sum(len(pairs) for pairs in self.triangles)
+        self.log_with_clock(logging.INFO, f"Triangles number {pairs_number}")
+        return None
+
+    def create_pairs_data(self):
+        self.get_pairs_data()
+        for pair in self.pairs_data:
+            self.pairs_data[pair]["last_prev"] = self.pairs_data[pair]["last"]
+            self.pairs_data[pair]["bid_timestamp"] = 0
+            self.pairs_data[pair]["ask_timestamp"] = 0
+        # self.log_with_clock(logging.INFO, f"pairs_data {self.pairs_data}")
+        self.log_with_clock(logging.INFO, f"pairs_data length {len(self.pairs_data)}")
+
+    def strategy_init(self):
+        self.create_triangles()
+
+        self.create_pairs_data()
 
     def on_tick(self):
+        if self.status == "NOT_INIT":
+            self.strategy_init()
+            self.status = "READY"
         # self.log_with_clock(logging.INFO, "New tick")
-        prices_updated = self.get_pairs_data()
-        if not prices_updated:
+
+        if not self.get_pairs_data():
             return
 
-        taker_2 = self.taker_pair_2
-        taker_2_bid = prices_updated[taker_2]['bid']
-        taker_2_ask = prices_updated[taker_2]['ask']
+        for cross_pair, base_assets in self.triangles.items():
+            quote_1, quote_2 = split_hb_trading_pair(cross_pair)
+            for base_asset in base_assets:
+                pair_1 = f"{base_asset}-{quote_1}"
+                pair_2 = f"{base_asset}-{quote_2}"
 
-        for num, market in enumerate(self.follow_markets):
-            maker_pair = market['maker']
-            taker_pair = market['taker']
+                # direct
+                self.get_profitability(pair_1, pair_2, cross_pair)
+                # reverse
+                self.get_profitability(pair_2, pair_1, cross_pair)
 
-            last_price = prices_updated[maker_pair]['last']
-            taker_1_bid = prices_updated[taker_pair]['bid']
-            taker_1_ask = prices_updated[taker_pair]['ask']
+    def get_profitability(self, maker_pair, taker_pair_1, taker_pair_2):
+        last_price = self.pairs_data[maker_pair]['last']
+        taker_1_bid = self.pairs_data[taker_pair_1]['bid']
+        taker_1_ask = self.pairs_data[taker_pair_1]['ask']
+        taker_2_bid = self.pairs_data[taker_pair_2]['bid']
+        taker_2_ask = self.pairs_data[taker_pair_2]['ask']
+        taker_1_base, taker_1_quote = split_hb_trading_pair(taker_pair_1)
+        taker_2_base, taker_2_quote = split_hb_trading_pair(taker_pair_2)
 
-            # self.log_with_clock(logging.INFO, f"market = {market}, last_price = {last_price}, "
-            #                                   f"taker_1_bid = {taker_1_bid}, taker_1_ask = {taker_1_ask}, "
-            #                                   f"taker_2_bid = {taker_2_bid}, taker_2_ask = {taker_2_ask}")
-            if last_price != market['last']:
-                self.follow_markets[num]['last'] = last_price
+        if last_price != self.pairs_data[maker_pair]['last_prev']:
+            self.pairs_data[maker_pair]['last_prev'] = last_price
 
-                if self.current_timestamp > market['bid_timestamp']:
-                    maker_buy_price = last_price
-                    taker_sell_price = taker_1_bid / taker_2_ask
-                    buy_profitability = 100 * (taker_sell_price / maker_buy_price - 1)
-                    self.log_with_clock(logging.INFO, f"BUY profitability for {maker_pair} = {buy_profitability}%")
+            if self.current_timestamp > self.pairs_data[maker_pair]['bid_timestamp']:
+                maker_buy_price = last_price
+                taker_sell_price = taker_1_bid / taker_2_ask if taker_1_quote == taker_2_quote else taker_1_bid * taker_2_bid
+                buy_profitability = 100 * (taker_sell_price / maker_buy_price - 1)
+                if maker_pair == "XMR-ETH" and taker_pair_1 == "XMR-USDT":
+                    self.log_with_clock(logging.INFO, f"BUY profitability for {maker_pair}, {taker_pair_1} = {buy_profitability}%")
 
-                    if buy_profitability > Decimal(self.min_profitability):
-                        msg = f"Buy profitability for {market['maker']} is {buy_profitability}%"
-                        self.log_with_clock(logging.INFO, msg)
-                        self.notify_hb_app_with_timestamp(msg)
-                        self.follow_markets[num]['bid_timestamp'] = self.current_timestamp + self.check_delay
+                if buy_profitability > Decimal(self.min_profitability):
+                    msg = f"Buy profitability for {maker_pair}, {taker_pair_1} is {buy_profitability}%"
+                    self.log_with_clock(logging.INFO, msg)
+                    self.notify_hb_app_with_timestamp(msg)
+                    self.pairs_data[maker_pair]['bid_timestamp'] = self.current_timestamp + self.check_delay
 
-                if self.current_timestamp > market['ask_timestamp']:
-                    maker_sell_price = last_price
-                    taker_buy_price = taker_1_ask / taker_2_bid
-                    sell_profitability = 100 * (maker_sell_price / taker_buy_price - 1)
-                    self.log_with_clock(logging.INFO, f"SELL profitability for {maker_pair} = {sell_profitability}%")
+            if self.current_timestamp > self.pairs_data[maker_pair]['ask_timestamp']:
+                maker_sell_price = last_price
+                taker_buy_price = taker_1_ask / taker_2_bid if taker_1_quote == taker_2_quote else taker_1_ask * taker_2_ask
+                sell_profitability = 100 * (maker_sell_price / taker_buy_price - 1)
+                if maker_pair == "XMR-ETH" and taker_pair_1 == "XMR-USDT":
+                    self.log_with_clock(logging.INFO, f"SELL profitability for {maker_pair}, {taker_pair_1} = {sell_profitability}%")
 
-                    if sell_profitability > Decimal(self.min_profitability):
-                        msg = f"Sell profitability for {market['maker']} is {sell_profitability}%"
-                        self.log_with_clock(logging.INFO, msg)
-                        self.notify_hb_app_with_timestamp(msg)
-                        self.follow_markets[num]['ask_timestamp'] = self.current_timestamp + self.check_delay
+                if sell_profitability > Decimal(self.min_profitability):
+                    msg = f"Sell profitability for {maker_pair}, {taker_pair_1} is {sell_profitability}%"
+                    self.log_with_clock(logging.INFO, msg)
+                    self.notify_hb_app_with_timestamp(msg)
+                    self.pairs_data[maker_pair]['ask_timestamp'] = self.current_timestamp + self.check_delay
+
+    #
+    #
+    #
+    # taker_2 = self.taker_pair_2
+    #     taker_2_bid = prices_updated[taker_2]['bid']
+    #     taker_2_ask = prices_updated[taker_2]['ask']
+    #
+    #     for num, market in enumerate(self.follow_markets):
+    #         maker_pair = market['maker']
+    #         taker_pair = market['taker']
+    #
+    #         last_price = prices_updated[maker_pair]['last']
+    #         taker_1_bid = prices_updated[taker_pair]['bid']
+    #         taker_1_ask = prices_updated[taker_pair]['ask']
+    #
+    #         # self.log_with_clock(logging.INFO, f"market = {market}, last_price = {last_price}, "
+    #         #                                   f"taker_1_bid = {taker_1_bid}, taker_1_ask = {taker_1_ask}, "
+    #         #                                   f"taker_2_bid = {taker_2_bid}, taker_2_ask = {taker_2_ask}")
+    #         if last_price != market['last']:
+    #             self.follow_markets[num]['last'] = last_price
+    #
+    #             if self.current_timestamp > market['bid_timestamp']:
+    #                 maker_buy_price = last_price
+    #                 taker_sell_price = taker_1_bid / taker_2_ask
+    #                 buy_profitability = 100 * (taker_sell_price / maker_buy_price - 1)
+    #                 self.log_with_clock(logging.INFO, f"BUY profitability for {maker_pair} = {buy_profitability}%")
+    #
+    #                 if buy_profitability > Decimal(self.min_profitability):
+    #                     msg = f"Buy profitability for {market['maker']} is {buy_profitability}%"
+    #                     self.log_with_clock(logging.INFO, msg)
+    #                     self.notify_hb_app_with_timestamp(msg)
+    #                     self.follow_markets[num]['bid_timestamp'] = self.current_timestamp + self.check_delay
+    #
+    #             if self.current_timestamp > market['ask_timestamp']:
+    #                 maker_sell_price = last_price
+    #                 taker_buy_price = taker_1_ask / taker_2_bid
+    #                 sell_profitability = 100 * (maker_sell_price / taker_buy_price - 1)
+    #                 self.log_with_clock(logging.INFO, f"SELL profitability for {maker_pair} = {sell_profitability}%")
+    #
+    #                 if sell_profitability > Decimal(self.min_profitability):
+    #                     msg = f"Sell profitability for {market['maker']} is {sell_profitability}%"
+    #                     self.log_with_clock(logging.INFO, msg)
+    #                     self.notify_hb_app_with_timestamp(msg)
+    #                     self.follow_markets[num]['ask_timestamp'] = self.current_timestamp + self.check_delay
 
 
             # self.log_with_clock(logging.INFO, f"market = {markt}, bid = {maker_bid}, ask = {maker_ask}")
