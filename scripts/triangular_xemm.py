@@ -11,21 +11,26 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 class TriangularXEMM(ScriptStrategyBase):
     # Config params
-    connector_name: str = "binance"
-    maker_pair: str = "RLC-ETH"
-    taker_pair_1: str = "RLC-USDT"
+    connector_name: str = "kucoin"
+    maker_pair: str = "XMR-ETH"
+    taker_pair_1: str = "XMR-USDT"
     taker_pair_2: str = "ETH-USDT"
 
-    min_spread: Decimal = Decimal("0.4")
-    max_spread: Decimal = Decimal("0.8")
+    min_spread: Decimal = Decimal("0.8")
+    max_spread: Decimal = Decimal("1.2")
 
-    order_amount: Decimal = Decimal("22")
-    set_target_from_balances = False
-    target_base_amount = Decimal("0")
-    target_quote_amount = Decimal("0.06")
+    order_amount: Decimal = Decimal("5")
+    set_target_from_balances = True
+    target_base_amount = Decimal("3")
+    target_quote_amount = Decimal("0.4")
     order_delay = 60
-    # min_order_amount = Decimal("1")
+    min_order_amount = Decimal("2")
     slippage_buffer = Decimal("1")
+
+    fee_asset = "KCS"
+    fee_asset_target_amount = 2
+    fee_pair = "KCS-USDT"
+    fee_asset_check_interval = 300
 
     # kill_switch_enabled: bool = True
     # kill_switch_rate = Decimal("-2")
@@ -46,8 +51,9 @@ class TriangularXEMM(ScriptStrategyBase):
     last_order_timestamp = 0
     place_order_trials_delay = 5
     place_order_trials_limit = 10
+    last_fee_asset_check_timestamp = 0
 
-    markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2}}
+    markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2, fee_pair}}
 
     @property
     def connector(self):
@@ -69,6 +75,11 @@ class TriangularXEMM(ScriptStrategyBase):
             return
 
         if self.current_timestamp < self.last_order_timestamp + self.order_delay:
+            return
+
+        if self.current_timestamp > self.last_fee_asset_check_timestamp + self.fee_asset_check_interval:
+            self.check_fee_asset()
+            self.last_fee_asset_check_timestamp = self.current_timestamp
             return
 
         # check for balances
@@ -133,6 +144,24 @@ class TriangularXEMM(ScriptStrategyBase):
               f"Target quote amount: {self.target_quote_amount} {self.assets['maker_quote']}"
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
+
+    def check_fee_asset(self):
+        fee_asset_diff = self.get_target_balance_diff(self.fee_asset, self.fee_asset_target_amount)
+        fee_asset_diff_quantize = self.connector.quantize_order_amount(self.fee_pair, abs(fee_asset_diff))
+
+        if fee_asset_diff_quantize != Decimal("0"):
+            if fee_asset_diff < 0:
+                order_price = self.connector.get_price(self.fee_pair, True) * Decimal(1 + self.slippage_buffer / 100)
+                buy_fee_asset_candidate = OrderCandidate(trading_pair=self.fee_pair,
+                                                         is_maker=True,
+                                                         order_type=OrderType.LIMIT,
+                                                         order_side=TradeType.BUY,
+                                                         amount=fee_asset_diff_quantize,
+                                                         price=order_price)
+            place_result = self.adjust_and_place_order(candidate=buy_fee_asset_candidate, all_or_none=True)
+            if place_result:
+                self.log_with_clock(logging.INFO, f"{fee_asset_diff_quantize} {self.fee_asset} "
+                                                  f"on the {self.fee_pair} market was bought to adjust fees assets")
 
     def process_hedge(self):
         if len(self.taker_candidates) > 0:
@@ -267,9 +296,17 @@ class TriangularXEMM(ScriptStrategyBase):
                                     f" {candidate_adjusted.order_side.name}"
                                     f" {candidate_adjusted.order_type.name} order")
             return False
-        else:
-            self.place_order(candidate_adjusted)
-            return True
+        if candidate_adjusted.trading_pair == self.maker_pair and candidate_adjusted.amount < Decimal(
+                self.min_order_amount):
+            self.log_with_clock(logging.INFO,
+                                f"Order candidate maker amount = {candidate_adjusted.amount} is less "
+                                f"than min_order_amount {self.min_order_amount}. "
+                                f"Can't create {candidate_adjusted.order_side.name}"
+                                f" {candidate_adjusted.order_type.name} order")
+            return False
+
+        self.place_order(candidate_adjusted)
+        return True
 
     def place_order(self, candidate_adjusted):
         if candidate_adjusted.order_side == TradeType.BUY:
