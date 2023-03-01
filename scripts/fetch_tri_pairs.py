@@ -1,8 +1,10 @@
 import logging
+import os
 
 import pandas as pd
 import requests
 
+from hummingbot import data_path
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
@@ -18,6 +20,7 @@ class FetchTriPairs(ScriptStrategyBase):
     url = "https://api.kucoin.com/api/v1/market/allTickers"
 
     taker_pair_2: str = "ETH-USDT"
+    volume_threshold_usd = 20000
 
     follow_markets = [{"maker": "XMR-ETH", "taker": "XMR-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
                       {"maker": "SDAO-ETH", "taker": "SDAO-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
@@ -33,7 +36,7 @@ class FetchTriPairs(ScriptStrategyBase):
     # follow_markets = [{"maker": "XMR-ETH", "taker": "XMR-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0},
     #                   {"maker": "AGIX-ETH", "taker": "AGIX-USDT", "last": 0, "bid_timestamp": 0, "ask_timestamp": 0}
     #                   ]
-    min_profitability = 2
+    min_profitability = 1
     check_delay = 60
 
     status = "NOT_INIT"
@@ -105,13 +108,9 @@ class FetchTriPairs(ScriptStrategyBase):
                 self.pairs_data[pair]["bid"] = Decimal(str(record["buy"]))
                 self.pairs_data[pair]["ask"] = Decimal(str(record["sell"]))
                 self.pairs_data[pair]["last"] = Decimal(str(record["last"]))
-        return True
-
-
-        # except Exception as e:
-        #     self.log_with_clock(logging.INFO, f"Error in getting data. record= {record}, Exception: {e}")
-        #
-        #     return False
+                # if self.status == "NOT_INIT" and record["vol"] and record["volValue"]:
+                #     self.pairs_data[pair]["vol_base"] = Decimal(str(record["vol"]))
+                #     self.pairs_data[pair]["vol_quote"] = Decimal(str(record["volValue"]))
         return True
 
     def create_quoted_pairs(self):
@@ -124,14 +123,33 @@ class FetchTriPairs(ScriptStrategyBase):
         """
         records = self.get_api_data()
         quoted_pairs = {}
+        total_volume = Decimal("0")
         if records:
             for row in records:
                 base, quote = split_hb_trading_pair(row["symbol"])
-                if quote not in quoted_pairs:
-                    quoted_pairs[quote] = [base]
+                vol_quote = Decimal(row["volValue"])
+                vol_base = Decimal(row["vol"])
+                if "USD" in quote:
+                    total_volume = vol_quote
+                elif "USD" in base:
+                    total_volume = vol_base
                 else:
-                    quoted_pairs[quote].append(base)
-        # self.log_with_clock(logging.INFO, f"Quoted pairs: {quoted_pairs}")
+                    conversion_pair = f"{base}-USDT"
+                    conversion_pair_quote = f"{quote}-USDT"
+                    if conversion_pair in self.pairs_data:
+                        conversion_price = self.pairs_data[conversion_pair]["bid"]
+                        total_volume = vol_base * conversion_price
+                    elif conversion_pair_quote in self.pairs_data:
+                        conversion_price = self.pairs_data[conversion_pair_quote]["bid"]
+                        total_volume = vol_quote * conversion_price
+                    else:
+                        self.log_with_clock(logging.INFO, f"Can't find price for calculating volume for {row['symbol']}")
+                if Decimal(total_volume) > self.volume_threshold_usd:
+                    if quote not in quoted_pairs:
+                        quoted_pairs[quote] = [base]
+                    else:
+                        quoted_pairs[quote].append(base)
+        self.log_with_clock(logging.INFO, f"Quoted pairs: {quoted_pairs}")
         return quoted_pairs
 
     def create_triangles(self):
@@ -177,9 +195,8 @@ class FetchTriPairs(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, f"pairs_data length {len(self.pairs_data)}")
 
     def strategy_init(self):
-        self.create_triangles()
-
         self.create_pairs_data()
+        self.create_triangles()
 
     def on_tick(self):
         if self.status == "NOT_INIT":
@@ -196,160 +213,88 @@ class FetchTriPairs(ScriptStrategyBase):
                 pair_1 = f"{base_asset}-{quote_1}"
                 pair_2 = f"{base_asset}-{quote_2}"
 
-                # direct
-                self.get_profitability(pair_1, pair_2, cross_pair)
-                # reverse
-                self.get_profitability(pair_2, pair_1, cross_pair)
+                # direct triangle pair_1, pair_2, cross_pair
+                if self.pairs_data[pair_1]['last'] != self.pairs_data[pair_1]['last_prev']:
+                    self.pairs_data[pair_1]['last_prev'] = self.pairs_data[pair_1]['last']
+                    self.get_profitability(True, True, pair_1, pair_2, cross_pair)
+                    self.get_profitability(False, True, pair_1, pair_2, cross_pair)
+                # reverse triangle pair_2, pair_1, cross_pair
+                if self.pairs_data[pair_2]['last'] != self.pairs_data[pair_2]['last_prev']:
+                    self.pairs_data[pair_2]['last_prev'] = self.pairs_data[pair_2]['last']
+                    self.get_profitability(True, False, pair_2, pair_1, cross_pair)
+                    self.get_profitability(False, False, pair_2, pair_1, cross_pair)
 
-    def get_profitability(self, maker_pair, taker_pair_1, taker_pair_2):
+    def get_profitability(self, is_bid, is_taker_quotes_equal, maker_pair, taker_pair_1, taker_pair_2):
         last_price = self.pairs_data[maker_pair]['last']
         taker_1_bid = self.pairs_data[taker_pair_1]['bid']
         taker_1_ask = self.pairs_data[taker_pair_1]['ask']
         taker_2_bid = self.pairs_data[taker_pair_2]['bid']
         taker_2_ask = self.pairs_data[taker_pair_2]['ask']
-        taker_1_base, taker_1_quote = split_hb_trading_pair(taker_pair_1)
-        taker_2_base, taker_2_quote = split_hb_trading_pair(taker_pair_2)
 
-        if last_price != self.pairs_data[maker_pair]['last_prev']:
-            self.pairs_data[maker_pair]['last_prev'] = last_price
+        timestamp = "bid_timestamp" if is_bid else "ask_timestamp"
+        if self.current_timestamp > self.pairs_data[maker_pair][timestamp]:
+            maker_price = last_price
+            if is_taker_quotes_equal:
+                taker_price = taker_1_bid / taker_2_ask if is_bid else taker_1_ask / taker_2_bid
+            else:
+                taker_price = taker_1_bid * taker_2_bid if is_bid else taker_1_ask * taker_2_ask
+            result = taker_price / maker_price if is_bid else maker_price / taker_price
+            profitability = round(100 * (result - 1), 2)
 
-            if self.current_timestamp > self.pairs_data[maker_pair]['bid_timestamp']:
-                maker_buy_price = last_price
-                taker_sell_price = taker_1_bid / taker_2_ask if taker_1_quote == taker_2_quote else taker_1_bid * taker_2_bid
-                buy_profitability = 100 * (taker_sell_price / maker_buy_price - 1)
-                if maker_pair == "XMR-ETH" and taker_pair_1 == "XMR-USDT":
-                    self.log_with_clock(logging.INFO, f"BUY profitability for {maker_pair}, {taker_pair_1} = {buy_profitability}%")
+            if profitability > Decimal(self.min_profitability):
+                side = "BUY" if is_bid else "SELL"
+                msg = f"{side} Profitability for {maker_pair}, {taker_pair_1} is {profitability}%"
+                data_to_save = [self.current_timestamp, f"{maker_pair} {taker_pair_1}", side, profitability,
+                                last_price, taker_1_bid, taker_1_ask, taker_2_bid, taker_2_ask]
+                self.create_and_save_to_file_dataframe(data_to_save)
+                self.log_with_clock(logging.INFO, msg)
+                self.notify_hb_app_with_timestamp(msg)
+                self.pairs_data[maker_pair][timestamp] = self.current_timestamp + self.check_delay
+        #     maker_buy_price = last_price
+        #     taker_sell_price = taker_1_bid / taker_2_ask if taker_1_quote == taker_2_quote else taker_1_bid * taker_2_bid
+        #     buy_profitability = round(100 * (taker_sell_price / maker_buy_price - 1), 2)
+        #     # self.log_with_clock(logging.INFO, f"BUY profitability for {maker_pair}, {taker_pair_1} = {buy_profitability}%")
+        #
+        #     if buy_profitability > Decimal(self.min_profitability):
+        #         msg = f"Buy profitability for {maker_pair}, {taker_pair_1} is {buy_profitability}%"
+        #         data_to_save = [self.current_timestamp, f"{maker_pair} {taker_pair_1}", "BUY", buy_profitability,
+        #                         last_price, taker_1_bid, taker_1_ask, taker_2_bid, taker_2_ask]
+        #         self.create_and_save_to_file_dataframe(data_to_save)
+        #         self.log_with_clock(logging.INFO, msg)
+        #         self.notify_hb_app_with_timestamp(msg)
+        #         self.pairs_data[maker_pair]['bid_timestamp'] = self.current_timestamp + self.check_delay
+        #
+        # if self.current_timestamp > self.pairs_data[maker_pair]['ask_timestamp']:
+        #     maker_sell_price = last_price
+        #     taker_buy_price = taker_1_ask / taker_2_bid if taker_1_quote == taker_2_quote else taker_1_ask * taker_2_ask
+        #     sell_profitability = round(100 * (maker_sell_price / taker_buy_price - 1), 2)
+        #     # self.log_with_clock(logging.INFO, f"SELL profitability for {maker_pair}, {taker_pair_1} = {sell_profitability}%")
+        #
+        #     if sell_profitability > Decimal(self.min_profitability):
+        #         msg = f"Sell profitability for {maker_pair}, {taker_pair_1} is {sell_profitability}%"
+        #         data_to_save = [self.current_timestamp, f"{maker_pair} {taker_pair_1}", "SELL", sell_profitability,
+        #                         last_price, taker_1_bid, taker_1_ask, taker_2_bid, taker_2_ask]
+        #         self.create_and_save_to_file_dataframe(data_to_save)
+        #         self.log_with_clock(logging.INFO, msg)
+        #         self.notify_hb_app_with_timestamp(msg)
+        #         self.pairs_data[maker_pair]['ask_timestamp'] = self.current_timestamp + self.check_delay
 
-                if buy_profitability > Decimal(self.min_profitability):
-                    msg = f"Buy profitability for {maker_pair}, {taker_pair_1} is {buy_profitability}%"
-                    self.log_with_clock(logging.INFO, msg)
-                    self.notify_hb_app_with_timestamp(msg)
-                    self.pairs_data[maker_pair]['bid_timestamp'] = self.current_timestamp + self.check_delay
+    def create_and_save_to_file_dataframe(self, data_list):
+        columns_headers = ["Time", "Pairs", "Side", "Profitability", "maker_last_price",
+                           "taker_1_bid", "taker_1_ask", "taker_2_bid", "taker_2_ask"]
+        data_df = pd.DataFrame([data_list], columns=columns_headers)
 
-            if self.current_timestamp > self.pairs_data[maker_pair]['ask_timestamp']:
-                maker_sell_price = last_price
-                taker_buy_price = taker_1_ask / taker_2_bid if taker_1_quote == taker_2_quote else taker_1_ask * taker_2_ask
-                sell_profitability = 100 * (maker_sell_price / taker_buy_price - 1)
-                if maker_pair == "XMR-ETH" and taker_pair_1 == "XMR-USDT":
-                    self.log_with_clock(logging.INFO, f"SELL profitability for {maker_pair}, {taker_pair_1} = {sell_profitability}%")
+        # Save to file separately for each trading pair
+        self.export_to_csv(data_df, columns_headers)
 
-                if sell_profitability > Decimal(self.min_profitability):
-                    msg = f"Sell profitability for {maker_pair}, {taker_pair_1} is {sell_profitability}%"
-                    self.log_with_clock(logging.INFO, msg)
-                    self.notify_hb_app_with_timestamp(msg)
-                    self.pairs_data[maker_pair]['ask_timestamp'] = self.current_timestamp + self.check_delay
+    def export_to_csv(self, data_df, columns_headers):
+        """
+        Appends new data to a csv file, separate for each trading pair.
+        """
+        csv_filename = f"data_fetch_tri_pairs_{self.connector_name}.csv"
+        csv_path = os.path.join(data_path(), csv_filename)
+        csv_df = data_df
 
-    #
-    #
-    #
-    # taker_2 = self.taker_pair_2
-    #     taker_2_bid = prices_updated[taker_2]['bid']
-    #     taker_2_ask = prices_updated[taker_2]['ask']
-    #
-    #     for num, market in enumerate(self.follow_markets):
-    #         maker_pair = market['maker']
-    #         taker_pair = market['taker']
-    #
-    #         last_price = prices_updated[maker_pair]['last']
-    #         taker_1_bid = prices_updated[taker_pair]['bid']
-    #         taker_1_ask = prices_updated[taker_pair]['ask']
-    #
-    #         # self.log_with_clock(logging.INFO, f"market = {market}, last_price = {last_price}, "
-    #         #                                   f"taker_1_bid = {taker_1_bid}, taker_1_ask = {taker_1_ask}, "
-    #         #                                   f"taker_2_bid = {taker_2_bid}, taker_2_ask = {taker_2_ask}")
-    #         if last_price != market['last']:
-    #             self.follow_markets[num]['last'] = last_price
-    #
-    #             if self.current_timestamp > market['bid_timestamp']:
-    #                 maker_buy_price = last_price
-    #                 taker_sell_price = taker_1_bid / taker_2_ask
-    #                 buy_profitability = 100 * (taker_sell_price / maker_buy_price - 1)
-    #                 self.log_with_clock(logging.INFO, f"BUY profitability for {maker_pair} = {buy_profitability}%")
-    #
-    #                 if buy_profitability > Decimal(self.min_profitability):
-    #                     msg = f"Buy profitability for {market['maker']} is {buy_profitability}%"
-    #                     self.log_with_clock(logging.INFO, msg)
-    #                     self.notify_hb_app_with_timestamp(msg)
-    #                     self.follow_markets[num]['bid_timestamp'] = self.current_timestamp + self.check_delay
-    #
-    #             if self.current_timestamp > market['ask_timestamp']:
-    #                 maker_sell_price = last_price
-    #                 taker_buy_price = taker_1_ask / taker_2_bid
-    #                 sell_profitability = 100 * (maker_sell_price / taker_buy_price - 1)
-    #                 self.log_with_clock(logging.INFO, f"SELL profitability for {maker_pair} = {sell_profitability}%")
-    #
-    #                 if sell_profitability > Decimal(self.min_profitability):
-    #                     msg = f"Sell profitability for {market['maker']} is {sell_profitability}%"
-    #                     self.log_with_clock(logging.INFO, msg)
-    #                     self.notify_hb_app_with_timestamp(msg)
-    #                     self.follow_markets[num]['ask_timestamp'] = self.current_timestamp + self.check_delay
-
-
-            # self.log_with_clock(logging.INFO, f"market = {markt}, bid = {maker_bid}, ask = {maker_ask}")
-
-    #     for trading_pair in self.pairs_data:
-    #         if self.current_timestamp > trading_pair['bid_timestamp']:
-    #             bid_profitability = self.calculate_profitability(pair=trading_pair, is_bid=True)
-    #             if bid_profitability > Decimal(self.min_profitability):
-    #                 msg = f"Bid profitability for {trading_pair['maker']} is {bid_profitability}%"
-    #                 self.log_with_clock(logging.INFO, msg)
-    #                 self.notify_hb_app_with_timestamp(msg)
-    #                 trading_pair['bid_timestamp'] = self.current_timestamp + self.check_delay
-    #
-    #         if self.current_timestamp > trading_pair['ask_timestamp']:
-    #             ask_profitability = self.calculate_profitability(pair=trading_pair, is_bid=False)
-    #             if ask_profitability > Decimal(self.min_profitability):
-    #                 msg = f"Ask profitability for {trading_pair['maker']} is {ask_profitability}%"
-    #                 self.log_with_clock(logging.INFO, msg)
-    #                 self.notify_hb_app_with_timestamp(msg)
-    #                 trading_pair['ask_timestamp'] = self.current_timestamp + self.check_delay
-    #
-    # def calculate_profitability(self, pair, is_bid):
-    #     order_amount = self.order_amount_quote / self.connector.get_mid_price(pair['maker'])
-    #     best_maker_price = self.connector.get_price(pair['maker'], not is_bid)
-    #     taker_price = self.calculate_taker_price(is_bid, order_amount, pair['taker'], self.taker_pair_2)
-    #     result = taker_price / best_maker_price if is_bid else best_maker_price / taker_price
-    #     profitability = 100 * (result - 1)
-    #
-    #     return profitability
-    #
-    # def calculate_taker_price(self, is_bid, order_amount, taker_pair_1, taker_pair_2):
-    #     side_taker_1 = not is_bid
-    #     exchanged_amount_1 = self.connector.get_quote_volume_for_base_amount(taker_pair_1, side_taker_1,
-    #                                                                          order_amount).result_volume
-    #     if not self.quote_assets_reverse:
-    #         side_taker_2 = not side_taker_1
-    #         exchanged_amount_2 = self.get_base_amount_for_quote_volume(taker_pair_2, side_taker_2,
-    #                                                                    exchanged_amount_1)
-    #     else:
-    #         side_taker_2 = side_taker_1
-    #         exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(taker_pair_2, side_taker_2,
-    #                                                                              exchanged_amount_1).result_volume
-    #     final_price = exchanged_amount_2 / order_amount
-    #     return final_price
-    #
-    # def get_base_amount_for_quote_volume(self, pair, side, quote_volume) -> Decimal:
-    #     """
-    #     Calculates base amount that you get for the quote volume using the orderbook entries
-    #     """
-    #     orderbook = self.connector.get_order_book(pair)
-    #     orderbook_entries = orderbook.ask_entries() if side else orderbook.bid_entries()
-    #
-    #     cumulative_volume = 0.
-    #     cumulative_base_amount = 0.
-    #     quote_volume = float(quote_volume)
-    #
-    #     for order_book_row in orderbook_entries:
-    #         row_amount = order_book_row.amount
-    #         row_price = order_book_row.price
-    #         row_volume = row_amount * row_price
-    #         if row_volume + cumulative_volume >= quote_volume:
-    #             row_volume = quote_volume - cumulative_volume
-    #             row_amount = row_volume / row_price
-    #         cumulative_volume += row_volume
-    #         cumulative_base_amount += row_amount
-    #         if cumulative_volume >= quote_volume:
-    #             break
-    #
-    #     return Decimal(cumulative_base_amount)
+        add_header = False if os.path.exists(csv_path) else True
+        csv_df.to_csv(csv_path, mode='a', header=add_header, index=False, columns=columns_headers)
 
