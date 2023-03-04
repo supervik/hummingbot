@@ -12,19 +12,19 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 class TriangularXEMM(ScriptStrategyBase):
     # Config params
     connector_name: str = "kucoin"
-    maker_pair: str = "XMR-ETH"
-    taker_pair_1: str = "XMR-USDT"
-    taker_pair_2: str = "ETH-USDT"
+    maker_pair: str = "ADA-BTC"
+    taker_pair_1: str = "ADA-USDT"
+    taker_pair_2: str = "BTC-USDT"
 
     min_spread: Decimal = Decimal("0.8")
     max_spread: Decimal = Decimal("1.2")
 
-    order_amount: Decimal = Decimal("5")
+    order_amount: Decimal = Decimal("100")
     set_target_from_balances = True
     target_base_amount = Decimal("3")
     target_quote_amount = Decimal("0.4")
     order_delay = 60
-    min_order_amount = Decimal("2")
+    min_order_amount = Decimal("20")
     slippage_buffer = Decimal("1")
 
     fee_asset = "KCS"
