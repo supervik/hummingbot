@@ -28,7 +28,7 @@ class TriangularXEMM(ScriptStrategyBase):
     slippage_buffer = Decimal("1")
 
     fee_asset = "KCS"
-    fee_asset_target_amount = 2
+    fee_asset_target_amount = Decimal("1")
     fee_pair = "KCS-USDT"
     fee_asset_check_interval = 300
 
@@ -279,12 +279,6 @@ class TriangularXEMM(ScriptStrategyBase):
             place_result = self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
             if place_result:
                 self.log_with_clock(logging.INFO, "Placed maker SELL order")
-            # sell_candidate_adjusted = self.connector.budget_checker.adjust_candidate(sell_candidate, all_or_none=False)
-            # if sell_candidate_adjusted.amount > Decimal("0"):
-            #     self.place_order(sell_candidate_adjusted)
-            # else:
-            #     self.log_with_clock(logging.INFO, f"SELL amount is less than allowed on the maker market"
-            #                                       f"{self.maker_pair} Can't place order.")
 
     def adjust_and_place_order(self, candidate, all_or_none):
         candidate_adjusted = self.connector.budget_checker.adjust_candidate(candidate, all_or_none=all_or_none)
