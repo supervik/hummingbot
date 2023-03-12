@@ -6,8 +6,10 @@ import time
 import requests
 
 from hummingbot import data_path
+from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import Decimal, ScriptStrategyBase
+from hummingbot.client.hummingbot_application import HummingbotApplication
 
 
 class CandleSticksTails(ScriptStrategyBase):
@@ -33,6 +35,7 @@ class CandleSticksTails(ScriptStrategyBase):
     limit = 0
     # if pairs_threshold = 0 all available pairs will be calculated
     pairs_threshold = 0
+    pairs_data = ""
 
     @property
     def connector(self):
@@ -99,6 +102,71 @@ class CandleSticksTails(ScriptStrategyBase):
             self.log_with_clock(logging.INFO, f"trading_pair = {trading_pair}, records = {records}")
             return False
 
+    def get_volume_kucoin(self):
+        """
+        Fetches data and returns a list daily close
+        This is the API response data structure:
+        {
+            "time":1602832092060,
+            "ticker":[
+                {
+                    "symbol": "BTC-USDT",   // symbol
+                    "symbolName":"BTC-USDT", // Name of trading pairs, it would change after renaming
+                    "buy": "11328.9",   // bestBid
+                    "sell": "11329",    // bestAsk
+                    "changeRate": "-0.0055",    // 24h change rate
+                    "changePrice": "-63.6", // 24h change price
+                    "high": "11610",    // 24h highest price
+                    "low": "11200", // 24h lowest price
+                    "vol": "2282.70993217", // 24h volume，the aggregated trading volume in BTC
+                    "volValue": "25984946.157790431",   // 24h total, the trading volume in quote currency of last 24 hours
+                    "last": "11328.9",  // last price
+                    "averagePrice": "11360.66065903",   // 24h average transaction price yesterday
+                    "takerFeeRate": "0.001",    // Basic Taker Fee
+                    "makerFeeRate": "0.001",    // Basic Maker Fee
+                    "takerCoefficient": "1",    // Taker Fee Coefficient
+                    "makerCoefficient": "1" // Maker Fee Coefficient
+                }
+            ]
+        }
+        Creates pairs_data dictionary in the following structure:
+        'NEO-BTC': {'bid': '0.0005159', 
+                    'ask': '0.0005169', 
+                    'vol_base': '2809.305794', 
+                    'vol_quote': '1.5022394780543', 
+                    'volume_usd': '32453.6623934468'}
+        """
+        url = "https://api.kucoin.com/api/v1/market/allTickers"
+        records = requests.get(url=url).json()
+        if records["code"] != "200000":
+            return None
+        self.pairs_data = {row["symbol"]: {"bid": Decimal(row["buy"]),
+                                           "ask": Decimal(row["sell"]),
+                                           "vol_base": Decimal(row["vol"]),
+                                           "vol_quote": Decimal(row["volValue"])}
+                           for row in records["data"]["ticker"]}
+
+        for pair, data in self.pairs_data.items():
+            base, quote = split_hb_trading_pair(pair)
+            if "USD" in quote:
+                volume_usd = data["vol_quote"]
+            elif "USD" in base:
+                volume_usd = data["vol_base"]
+            else:
+                conversion_pair = f"{base}-USDT"
+                conversion_pair_quote = f"{quote}-USDT"
+                if conversion_pair in self.pairs_data:
+                    conversion_price = self.pairs_data[conversion_pair]["bid"]
+                    volume_usd = data["vol_base"] * conversion_price
+                elif conversion_pair_quote in self.pairs_data:
+                    conversion_price = self.pairs_data[conversion_pair_quote]["bid"]
+                    volume_usd = data["vol_quote"] * conversion_price
+                else:
+                    self.log_with_clock(logging.INFO, f"Can't find price for calculating volume for {pair}")
+                    continue
+            self.pairs_data[pair]["volume_usd"] = round(volume_usd)
+        # self.log_with_clock(logging.INFO, f"self.pairs_data = {self.pairs_data}")
+
     def on_tick(self):
         if self.status == "NOT_ACTIVE":
             return
@@ -108,14 +176,14 @@ class CandleSticksTails(ScriptStrategyBase):
         if self.status == "FETCH_TAILS":
             self.all_pairs = pd.read_csv(os.path.join(data_path(), f"all_pairs_{self.connector_name}.csv"),
                                          names=["pair"]).pair.tolist()
+            self.get_volume_kucoin()
             self.limit = self.pairs_threshold if self.pairs_threshold else len(self.all_pairs)
             self.status = "FETCH_TAILS_STARTED"
 
         if self.counter > self.limit - 1:
             self.finish_and_save_result()
-            return
-
-        self.process_pair(self.all_pairs[self.counter])
+        else:
+            self.process_pair(self.all_pairs[self.counter])
 
     def fetch_all_trading_pairs(self):
         """
@@ -149,23 +217,28 @@ class CandleSticksTails(ScriptStrategyBase):
         candles_df = pd.DataFrame(candles_df)
         candles_df_up = candles_df[candles_df.close >= candles_df.open]
         candles_df_down = candles_df[candles_df.close < candles_df.open]
-        candles_df_up = candles_df_up.assign(up_tail=100 * (candles_df_up['high'] - candles_df_up['close']) / candles_df_up['close'])
-        candles_df_up = candles_df_up.assign(down_tail=100 * (candles_df_up['open'] - candles_df_up['low']) / candles_df_up['open'])
-        candles_df_down = candles_df_down.assign(up_tail=100 * (candles_df_down['high'] - candles_df_down['open']) / candles_df_down['open'])
-        candles_df_down = candles_df_down.assign(down_tail=100 * (candles_df_down['close'] - candles_df_down['low']) / candles_df_down['close'])
+        candles_df_up = candles_df_up.assign(
+            up_tail=100 * (candles_df_up['high'] - candles_df_up['close']) / candles_df_up['close'])
+        candles_df_up = candles_df_up.assign(
+            down_tail=100 * (candles_df_up['open'] - candles_df_up['low']) / candles_df_up['open'])
+        candles_df_down = candles_df_down.assign(
+            up_tail=100 * (candles_df_down['high'] - candles_df_down['open']) / candles_df_down['open'])
+        candles_df_down = candles_df_down.assign(
+            down_tail=100 * (candles_df_down['close'] - candles_df_down['low']) / candles_df_down['close'])
 
         candles_df = [candles_df_up, candles_df_down]
         candles_df = pd.concat(candles_df)
         candles_df = candles_df[['up_tail', 'down_tail']]
         df_max_tails = candles_df.max(axis=1)
 
-        data_list = [pair]
+        total_volume_usd = self.pairs_data[pair]["volume_usd"] if pair in self.pairs_data else Decimal("0")
+        data_list = [pair, total_volume_usd]
 
         for threshold in self.tail_pct_threshold:
             df_max_tails = df_max_tails[df_max_tails >= threshold]
             data_list.append(df_max_tails.count())
 
-        data_df = pd.DataFrame([data_list])
+        data_df = pd.DataFrame([data_list], columns=["pair", "volume_usd", "0_5", "1", "1_5", "2", "2_5", "3"])
         self.long_tails = pd.concat([self.long_tails, data_df])
         self.counter += 1
 
@@ -178,5 +251,4 @@ class CandleSticksTails(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, f"Long tail calculation finished")
         self.log_with_clock(logging.INFO, f"long_tails df: {self.long_tails}")
         self.status = "NOT_ACTIVE"
-
-
+        HummingbotApplication.main_application().stop()
