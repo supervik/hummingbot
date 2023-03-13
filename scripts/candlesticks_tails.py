@@ -19,7 +19,7 @@ class CandleSticksTails(ScriptStrategyBase):
     - Get 1000 5 min candles for each trading pair and saves maximum up and down tails number into a csv file
     """
     # Config params
-    connector_name: str = "kucoin"
+    connector_name: str = "binance"
     fake_pair = "SOL-USDT"
     tail_pct_threshold = [0.5, 1, 1.5, 2, 2.5, 3]
 
@@ -35,7 +35,7 @@ class CandleSticksTails(ScriptStrategyBase):
     limit = 0
     # if pairs_threshold = 0 all available pairs will be calculated
     pairs_threshold = 0
-    pairs_data = ""
+    pairs_data = {}
 
     @property
     def connector(self):
@@ -50,14 +50,23 @@ class CandleSticksTails(ScriptStrategyBase):
         """
         self.all_pairs = await self.connector.all_trading_pairs()
 
-    def get_ohlc(self, connector_name, trading_pair):
+    def get_ohlc(self, trading_pair):
         """
         Helper method to choose which method to use
         """
-        if connector_name == "binance":
+        if self.connector_name == "binance":
             return self.get_ohlc_binance(trading_pair)
-        if connector_name == "kucoin":
+        if self.connector_name == "kucoin":
             return self.get_ohlc_kucoin(trading_pair)
+
+    def get_pairs_data(self):
+        """
+        Helper method to choose which method to use
+        """
+        if self.connector_name == "binance":
+            return self.get_pairs_data_binance()
+        if self.connector_name == "kucoin":
+            return self.get_pairs_data_kucoin()
 
     def get_ohlc_binance(self, trading_pair):
         """
@@ -102,7 +111,7 @@ class CandleSticksTails(ScriptStrategyBase):
             self.log_with_clock(logging.INFO, f"trading_pair = {trading_pair}, records = {records}")
             return False
 
-    def get_volume_kucoin(self):
+    def get_pairs_data_kucoin(self):
         """
         Fetches data and returns a list daily close
         This is the API response data structure:
@@ -146,6 +155,39 @@ class CandleSticksTails(ScriptStrategyBase):
                                            "vol_quote": Decimal(row["volValue"])}
                            for row in records["data"]["ticker"]}
 
+    def get_symbols_translation_binance(self):
+        url = "https://api.binance.com/api/v3/exchangeInfo"
+        records = requests.get(url=url).json()
+        symbols_translate = {row["symbol"]: f"{row['baseAsset']}-{row['quoteAsset']}" for row in records["symbols"]}
+
+        return symbols_translate
+
+    def get_pairs_data_binance(self):
+        """
+        Creates pairs_data dictionary in the following structure:
+        'NEO-BTC': {'bid': '0.0005159',
+                    'ask': '0.0005169',
+                    'vol_base': '2809.305794',
+                    'vol_quote': '1.5022394780543'}
+        """
+        translation = self.get_symbols_translation_binance()
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        records = requests.get(url=url).json()
+        for row in records:
+            if row["symbol"] in translation:
+                pair = translation[row["symbol"]]
+                self.pairs_data[pair] = {"bid": Decimal(row["bidPrice"]),
+                                         "ask": Decimal(row["askPrice"]),
+                                         "vol_base": Decimal(row["volume"]),
+                                         "vol_quote": Decimal(row["quoteVolume"])}
+            else:
+                self.log_with_clock(logging.INFO, f"Symbol {row['symbol']} is not found in the translation dict")
+
+    def get_volume_usd(self):
+        """
+        adds volume_usd to the pairs_data dictionary
+        'volume_usd': '32453.6623934468'
+        """
         for pair, data in self.pairs_data.items():
             base, quote = split_hb_trading_pair(pair)
             if "USD" in quote:
@@ -165,7 +207,6 @@ class CandleSticksTails(ScriptStrategyBase):
                     self.log_with_clock(logging.INFO, f"Can't find price for calculating volume for {pair}")
                     continue
             self.pairs_data[pair]["volume_usd"] = round(volume_usd)
-        # self.log_with_clock(logging.INFO, f"self.pairs_data = {self.pairs_data}")
 
     def on_tick(self):
         if self.status == "NOT_ACTIVE":
@@ -174,9 +215,10 @@ class CandleSticksTails(ScriptStrategyBase):
             self.fetch_all_trading_pairs()
             return
         if self.status == "FETCH_TAILS":
+            self.get_pairs_data()
+            self.get_volume_usd()
             self.all_pairs = pd.read_csv(os.path.join(data_path(), f"all_pairs_{self.connector_name}.csv"),
                                          names=["pair"]).pair.tolist()
-            self.get_volume_kucoin()
             self.limit = self.pairs_threshold if self.pairs_threshold else len(self.all_pairs)
             self.status = "FETCH_TAILS_STARTED"
 
@@ -184,6 +226,7 @@ class CandleSticksTails(ScriptStrategyBase):
             self.finish_and_save_result()
         else:
             self.process_pair(self.all_pairs[self.counter])
+            self.counter += 1
 
     def fetch_all_trading_pairs(self):
         """
@@ -204,15 +247,15 @@ class CandleSticksTails(ScriptStrategyBase):
             self.all_pairs = False
             self.log_with_clock(logging.INFO, f"Fetching all pairs finished")
             self.status = "NOT_ACTIVE"
+            HummingbotApplication.main_application().stop()
 
     def process_pair(self, pair):
         """
         Fetches OHLC for a pair, calculates the number of tails that exceeds the threshold and saves to self.long_tails
         """
         self.log_with_clock(logging.INFO, f"Processing {self.counter + 1} / {self.limit} pair: {pair}")
-        candles_df = self.get_ohlc(self.connector_name, pair)
+        candles_df = self.get_ohlc(pair)
         if not candles_df:
-            self.counter += 1
             return
         candles_df = pd.DataFrame(candles_df)
         candles_df_up = candles_df[candles_df.close >= candles_df.open]
@@ -240,7 +283,6 @@ class CandleSticksTails(ScriptStrategyBase):
 
         data_df = pd.DataFrame([data_list], columns=["pair", "volume_usd", "0_5", "1", "1_5", "2", "2_5", "3"])
         self.long_tails = pd.concat([self.long_tails, data_df])
-        self.counter += 1
 
     def finish_and_save_result(self):
         """
