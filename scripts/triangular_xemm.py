@@ -20,11 +20,11 @@ class TriangularXEMM(ScriptStrategyBase):
     max_spread: Decimal = Decimal("1.2")
 
     order_amount: Decimal = Decimal("100")
+    min_order_amount = Decimal("20")
     set_target_from_balances = True
     target_base_amount = Decimal("3")
     target_quote_amount = Decimal("0.4")
     order_delay = 60
-    min_order_amount = Decimal("20")
     slippage_buffer = Decimal("1")
 
     fee_asset = "KCS"
@@ -158,10 +158,22 @@ class TriangularXEMM(ScriptStrategyBase):
                                                          order_side=TradeType.BUY,
                                                          amount=fee_asset_diff_quantize,
                                                          price=order_price)
-            place_result = self.adjust_and_place_order(candidate=buy_fee_asset_candidate, all_or_none=True)
-            if place_result:
-                self.log_with_clock(logging.INFO, f"{fee_asset_diff_quantize} {self.fee_asset} "
-                                                  f"on the {self.fee_pair} market was bought to adjust fees assets")
+                place_result = self.adjust_and_place_order(candidate=buy_fee_asset_candidate, all_or_none=True)
+                if place_result:
+                    self.log_with_clock(logging.INFO, f"{fee_asset_diff_quantize} {self.fee_asset} "
+                                                      f"on the {self.fee_pair} market was bought to adjust fees assets")
+            if fee_asset_diff > 0:
+                order_price = self.connector.get_price(self.fee_pair, False) * Decimal(1 - self.slippage_buffer / 100)
+                sell_fee_asset_candidate = OrderCandidate(trading_pair=self.fee_pair,
+                                                         is_maker=True,
+                                                         order_type=OrderType.LIMIT,
+                                                         order_side=TradeType.SELL,
+                                                         amount=fee_asset_diff_quantize,
+                                                         price=order_price)
+                place_result = self.adjust_and_place_order(candidate=sell_fee_asset_candidate, all_or_none=True)
+                if place_result:
+                    self.log_with_clock(logging.INFO, f"{fee_asset_diff_quantize} {self.fee_asset} "
+                                                      f"on the {self.fee_pair} market was sold to adjust fees assets")
 
     def process_hedge(self):
         if len(self.taker_candidates) > 0:
