@@ -52,6 +52,10 @@ class TriangularXEMM(ScriptStrategyBase):
     place_order_trials_delay = 5
     place_order_trials_limit = 10
     last_fee_asset_check_timestamp = 0
+    taker_quote_balance = 0
+    round_profit_threshold = Decimal("-0.1")
+    round_profit_threshold_counter = 0
+    round_profit_threshold_limit = 3
 
     markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2, fee_pair}}
 
@@ -198,10 +202,23 @@ class TriangularXEMM(ScriptStrategyBase):
                     delay = candidate['sent_timestamp'] + self.place_order_trials_delay - self.current_timestamp
                     self.log_with_clock(logging.INFO, f"Too early to place an order. Try again. {delay} sec left.")
         else:
-            msg = "Arbitrage round completed"
-            self.notify_hb_app_with_timestamp(msg)
-            self.log_with_clock(logging.WARNING, msg)
-            self.status = "ACTIVE"
+            self.calculate_profit_round()
+
+    def calculate_profit_round(self):
+        taker_quote_balance_after = self.connector.get_balance(self.assets["taker_1_quote"])
+        round_profit = round(Decimal("100") * (taker_quote_balance_after - self.taker_quote_balance) / self.taker_quote_balance, 2)
+        msg = f"--- Arbitrage round completed. Profit {round_profit}%"
+        self.notify_hb_app_with_timestamp(msg)
+        self.log_with_clock(logging.WARNING, msg)
+        if round_profit < self.round_profit_threshold:
+            if self.round_profit_threshold_counter > self.round_profit_threshold_limit:
+                self.log_with_clock(logging.WARNING, f"More than {self.round_profit_threshold_limit} "
+                                                     f"orders are below limit threshold. Stop trading.")
+                self.status = "NOT_ACTIVE"
+                return
+            else:
+                self.round_profit_threshold_counter += 1
+        self.status = "ACTIVE"
 
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
@@ -239,11 +256,12 @@ class TriangularXEMM(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, "Hedging mode started")
         self.last_order_timestamp = self.current_timestamp
         self.cancel_all_orders()
+        self.taker_quote_balance = self.connector.get_balance(self.assets["taker_1_quote"])
 
         for i in range(2):
             amount = self.connector.quantize_order_amount(taker_order["pair"][i], taker_order["amount"][i])
             if amount <= Decimal("0"):
-                self.log_with_clock(logging.INFO, f"Can't add taker candidate {side} {taker_order['pair'][i]} "
+                self.log_with_clock(logging.INFO, f"Can't add taker candidate {taker_order['pair'][i]} "
                                                   f"to the list. Too low amount")
                 continue
             if taker_order["side"][i]:
