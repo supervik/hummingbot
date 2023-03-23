@@ -12,25 +12,25 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 class TriangularXEMM(ScriptStrategyBase):
     # Config params
     connector_name: str = "kucoin"
-    maker_pair: str = "ADA-BTC"
-    taker_pair_1: str = "ADA-USDT"
+    maker_pair: str = "USDT-DAI"
+    taker_pair_1: str = "BTC-DAI"
     taker_pair_2: str = "BTC-USDT"
 
-    min_spread: Decimal = Decimal("0.8")
-    max_spread: Decimal = Decimal("1.2")
+    min_spread: Decimal = Decimal("0.5")
+    max_spread: Decimal = Decimal("1")
 
-    order_amount: Decimal = Decimal("100")
-    min_order_amount = Decimal("20")
+    order_amount: Decimal = Decimal("10")
+    min_order_amount = Decimal("5")
     set_target_from_balances = True
     target_base_amount = Decimal("3")
     target_quote_amount = Decimal("0.4")
-    order_delay = 60
+    order_delay = 10
     slippage_buffer = Decimal("1")
 
     fee_asset = "KCS"
     fee_asset_target_amount = Decimal("1")
     fee_pair = "KCS-USDT"
-    fee_asset_check_interval = 300
+    fee_asset_check_interval = 60
 
     # kill_switch_enabled: bool = True
     # kill_switch_rate = Decimal("-2")
@@ -52,7 +52,7 @@ class TriangularXEMM(ScriptStrategyBase):
     place_order_trials_delay = 5
     place_order_trials_limit = 10
     last_fee_asset_check_timestamp = 0
-    taker_quote_balance = 0
+    balance_result_before = 0
     round_profit_threshold = Decimal("-0.1")
     round_profit_threshold_counter = 0
     round_profit_threshold_limit = 3
@@ -169,11 +169,11 @@ class TriangularXEMM(ScriptStrategyBase):
             if fee_asset_diff > 0:
                 order_price = self.connector.get_price(self.fee_pair, False) * Decimal(1 - self.slippage_buffer / 100)
                 sell_fee_asset_candidate = OrderCandidate(trading_pair=self.fee_pair,
-                                                         is_maker=True,
-                                                         order_type=OrderType.LIMIT,
-                                                         order_side=TradeType.SELL,
-                                                         amount=fee_asset_diff_quantize,
-                                                         price=order_price)
+                                                          is_maker=True,
+                                                          order_type=OrderType.LIMIT,
+                                                          order_side=TradeType.SELL,
+                                                          amount=fee_asset_diff_quantize,
+                                                          price=order_price)
                 place_result = self.adjust_and_place_order(candidate=sell_fee_asset_candidate, all_or_none=True)
                 if place_result:
                     self.log_with_clock(logging.INFO, f"{fee_asset_diff_quantize} {self.fee_asset} "
@@ -205,12 +205,15 @@ class TriangularXEMM(ScriptStrategyBase):
             self.calculate_profit_round()
 
     def calculate_profit_round(self):
-        taker_quote_balance_after = self.connector.get_balance(self.assets["taker_1_quote"])
-        round_profit = round(Decimal("100") * (taker_quote_balance_after - self.taker_quote_balance) / self.taker_quote_balance, 2)
-        msg = f"--- Arbitrage round completed. Profit {round_profit}%"
+        asset = self.assets["taker_1_base"] if self.assets["taker_1_base"] == self.assets["taker_2_base"] \
+            else self.assets["taker_1_quote"]
+        balance_result_after = self.connector.get_balance(asset)
+        profit = balance_result_after - self.balance_result_before
+        profit_pct = Decimal("100") * profit / self.balance_result_before
+        msg = f"--- Arbitrage round completed. Profit {profit} {asset} ({round(profit_pct, 2)}%)"
         self.notify_hb_app_with_timestamp(msg)
         self.log_with_clock(logging.WARNING, msg)
-        if round_profit < self.round_profit_threshold:
+        if profit_pct < self.round_profit_threshold:
             if self.round_profit_threshold_counter > self.round_profit_threshold_limit:
                 self.log_with_clock(logging.WARNING, f"More than {self.round_profit_threshold_limit} "
                                                      f"orders are below limit threshold. Stop trading.")
@@ -229,18 +232,35 @@ class TriangularXEMM(ScriptStrategyBase):
         return amount_diff
 
     def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
-        taker_side_1 = not is_maker_bid
-        taker_amount_1 = balances_diff_base
+        if self.assets["taker_1_base"] == self.assets["taker_2_base"]:
+            if self.assets["taker_1_quote"] == self.assets["maker_quote"]:
+                taker_side_1 = not is_maker_bid
+                taker_side_2 = is_maker_bid
+                taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
+                                                                       balances_diff_quote)
+                taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+                                                                       balances_diff_base)
+            else:
+                taker_side_1 = is_maker_bid
+                taker_side_2 = not is_maker_bid
+                taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
+                                                                       balances_diff_base)
+                taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+                                                                       balances_diff_quote)
+        else:
+            taker_side_1 = not is_maker_bid
+            taker_amount_1 = balances_diff_base
+
+            if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
+                taker_side_2 = True if is_maker_bid else False
+                taker_amount_2 = balances_diff_quote
+            else:
+                taker_side_2 = False if is_maker_bid else True
+                taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+                                                                       balances_diff_quote)
+
         taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1,
                                                             taker_amount_1).result_price
-
-        if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
-            taker_side_2 = True if is_maker_bid else False
-            taker_amount_2 = balances_diff_quote
-        else:
-            taker_side_2 = False if is_maker_bid else True
-            taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, False, balances_diff_quote)
-
         taker_price_2 = self.connector.get_price_for_volume(self.taker_pair_2, taker_side_2,
                                                             taker_amount_2).result_price
 
@@ -256,7 +276,9 @@ class TriangularXEMM(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, "Hedging mode started")
         self.last_order_timestamp = self.current_timestamp
         self.cancel_all_orders()
-        self.taker_quote_balance = self.connector.get_balance(self.assets["taker_1_quote"])
+        asset = self.assets["taker_1_base"] if self.assets["taker_1_base"] == self.assets["taker_2_base"] \
+            else self.assets["taker_1_quote"]
+        self.balance_result_before = self.connector.get_balance(asset)
 
         for i in range(2):
             amount = self.connector.quantize_order_amount(taker_order["pair"][i], taker_order["amount"][i])
@@ -347,25 +369,26 @@ class TriangularXEMM(ScriptStrategyBase):
             self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
 
     def calculate_taker_price(self, is_maker_bid):
-        side_taker_1 = not is_maker_bid
-        exchanged_amount_1 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_1, side_taker_1,
-                                                                             self.order_amount).result_volume
-        if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
-            side_taker_2 = not side_taker_1
-            exchanged_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, side_taker_2,
-                                                                       exchanged_amount_1)
-        else:
-            side_taker_2 = side_taker_1
-            exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_2, side_taker_2,
+        if self.assets["taker_1_base"] == self.assets["taker_2_base"]:
+            taker_side_1 = not is_maker_bid
+            taker_side_2 = is_maker_bid
+            exchanged_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+                                                                       self.order_amount)
+            exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_1, taker_side_1,
                                                                                  exchanged_amount_1).result_volume
+        else:
+            taker_side_1 = not is_maker_bid
+            exchanged_amount_1 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_1, taker_side_1,
+                                                                                 self.order_amount).result_volume
+            if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
+                taker_side_2 = not taker_side_1
+                exchanged_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+                                                                           exchanged_amount_1)
+            else:
+                taker_side_2 = taker_side_1
+                exchanged_amount_2 = self.connector.get_quote_volume_for_base_amount(self.taker_pair_2, taker_side_2,
+                                                                                     exchanged_amount_1).result_volume
         final_price = exchanged_amount_2 / self.order_amount
-        # tests
-        # test_price_taker_1_ask = self.connector.get_vwap_for_volume(self.taker_pair_1, True, self.order_amount).result_price
-        # test_price_taker_1_bid = self.connector.get_vwap_for_volume(self.taker_pair_1, False, self.order_amount).result_price
-        # order_amount_in_cross = self.connector.get_quote_volume_for_base_amount(self.maker_pair, True, self.order_amount).result_volume
-        # test_price_taker_2_ask = self.connector.get_vwap_for_volume(self.taker_pair_2, True, order_amount_in_cross).result_price
-        # test_price_taker_2_bid = self.connector.get_vwap_for_volume(self.taker_pair_2, False, order_amount_in_cross).result_price
-
         return final_price
 
     def check_and_cancel_maker_orders(self):
