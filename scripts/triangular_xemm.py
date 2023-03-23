@@ -26,6 +26,8 @@ class TriangularXEMM(ScriptStrategyBase):
     target_quote_amount = Decimal("0.4")
     order_delay = 10
     slippage_buffer = Decimal("1")
+    place_bid = False
+    place_ask = True
 
     fee_asset = "KCS"
     fee_asset_target_amount = Decimal("1")
@@ -307,7 +309,7 @@ class TriangularXEMM(ScriptStrategyBase):
             self.log_with_clock(logging.INFO, f"New taker candidate added to the list: {self.taker_candidates[-1]}")
 
     def place_maker_orders(self):
-        if not self.has_open_bid:
+        if not self.has_open_bid and self.place_bid:
             order_price = self.taker_sell_price * Decimal(1 - self.spread / 100)
             buy_candidate = OrderCandidate(trading_pair=self.maker_pair,
                                            is_maker=True,
@@ -319,7 +321,7 @@ class TriangularXEMM(ScriptStrategyBase):
             if place_result:
                 self.log_with_clock(logging.INFO, "Placed maker BUY order")
 
-        if not self.has_open_ask:
+        if not self.has_open_ask and self.place_ask:
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
             sell_candidate = OrderCandidate(
                 trading_pair=self.maker_pair,
