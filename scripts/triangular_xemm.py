@@ -16,19 +16,20 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_pair_1: str = "BTC-DAI"
     taker_pair_2: str = "BTC-USDT"
 
-    min_spread: Decimal = Decimal("0.5")
-    max_spread: Decimal = Decimal("1")
+    min_spread: Decimal = Decimal("1")
+    max_spread: Decimal = Decimal("1.5")
 
-    order_amount: Decimal = Decimal("10")
-    min_order_amount = Decimal("5")
-    set_target_from_balances = True
-    target_base_amount = Decimal("3")
-    target_quote_amount = Decimal("0.4")
+    order_amount: Decimal = Decimal("3")
+    min_order_amount = Decimal("1")
+    set_target_from_config = False
+    target_base_amount = Decimal("0.01")
+    target_quote_amount = Decimal("20")
     order_delay = 10
     slippage_buffer = Decimal("1")
-    place_bid = False
+    place_bid = True
     place_ask = True
 
+    fee_tracking_enabled = True
     fee_asset = "KCS"
     fee_asset_target_amount = Decimal("1")
     fee_pair = "KCS-USDT"
@@ -54,12 +55,11 @@ class TriangularXEMM(ScriptStrategyBase):
     place_order_trials_delay = 5
     place_order_trials_limit = 10
     last_fee_asset_check_timestamp = 0
-    balance_result_before = 0
-    round_profit_threshold = Decimal("-0.1")
-    round_profit_threshold_counter = 0
-    round_profit_threshold_limit = 3
 
-    markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2, fee_pair}}
+    if fee_tracking_enabled:
+        markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2, fee_pair}}
+    else:
+        markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2}}
 
     @property
     def connector(self):
@@ -83,10 +83,11 @@ class TriangularXEMM(ScriptStrategyBase):
         if self.current_timestamp < self.last_order_timestamp + self.order_delay:
             return
 
-        if self.current_timestamp > self.last_fee_asset_check_timestamp + self.fee_asset_check_interval:
-            self.check_fee_asset()
-            self.last_fee_asset_check_timestamp = self.current_timestamp
-            return
+        if self.fee_tracking_enabled:
+            if self.current_timestamp > self.last_fee_asset_check_timestamp + self.fee_asset_check_interval:
+                self.check_fee_asset()
+                self.last_fee_asset_check_timestamp = self.current_timestamp
+                return
 
         # check for balances
         balance_diff_base = self.get_target_balance_diff(self.assets["maker_base"], self.target_base_amount)
@@ -135,7 +136,7 @@ class TriangularXEMM(ScriptStrategyBase):
         self.spread = (self.min_spread + self.max_spread) / 2
 
     def set_target_amounts(self):
-        if self.set_target_from_balances:
+        if not self.set_target_from_config:
             self.notify_hb_app_with_timestamp(f"Setting target amounts from balances")
             self.target_base_amount = self.connector.get_balance(self.assets["maker_base"])
             self.target_quote_amount = self.connector.get_balance(self.assets["maker_quote"])
@@ -204,25 +205,12 @@ class TriangularXEMM(ScriptStrategyBase):
                     delay = candidate['sent_timestamp'] + self.place_order_trials_delay - self.current_timestamp
                     self.log_with_clock(logging.INFO, f"Too early to place an order. Try again. {delay} sec left.")
         else:
-            self.calculate_profit_round()
+            self.finalize_arbitrage()
 
-    def calculate_profit_round(self):
-        asset = self.assets["taker_1_base"] if self.assets["taker_1_base"] == self.assets["taker_2_base"] \
-            else self.assets["taker_1_quote"]
-        balance_result_after = self.connector.get_balance(asset)
-        profit = balance_result_after - self.balance_result_before
-        profit_pct = Decimal("100") * profit / self.balance_result_before
-        msg = f"--- Arbitrage round completed. Profit {profit} {asset} ({round(profit_pct, 2)}%)"
+    def finalize_arbitrage(self):
+        msg = f"--- Arbitrage round completed"
         self.notify_hb_app_with_timestamp(msg)
         self.log_with_clock(logging.WARNING, msg)
-        if profit_pct < self.round_profit_threshold:
-            if self.round_profit_threshold_counter > self.round_profit_threshold_limit:
-                self.log_with_clock(logging.WARNING, f"More than {self.round_profit_threshold_limit} "
-                                                     f"orders are below limit threshold. Stop trading.")
-                self.status = "NOT_ACTIVE"
-                return
-            else:
-                self.round_profit_threshold_counter += 1
         self.status = "ACTIVE"
 
     def get_target_balance_diff(self, asset, target_amount):
@@ -278,9 +266,6 @@ class TriangularXEMM(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, "Hedging mode started")
         self.last_order_timestamp = self.current_timestamp
         self.cancel_all_orders()
-        asset = self.assets["taker_1_base"] if self.assets["taker_1_base"] == self.assets["taker_2_base"] \
-            else self.assets["taker_1_quote"]
-        self.balance_result_before = self.connector.get_balance(asset)
 
         for i in range(2):
             amount = self.connector.quantize_order_amount(taker_order["pair"][i], taker_order["amount"][i])
