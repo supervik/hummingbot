@@ -21,11 +21,11 @@ class TriangularXEMM(ScriptStrategyBase):
 
     order_amount: Decimal = Decimal("3")
     min_order_amount = Decimal("1")
+
     set_target_from_config = False
     target_base_amount = Decimal("0.01")
     target_quote_amount = Decimal("20")
-    order_delay = 10
-    slippage_buffer = Decimal("1")
+
     place_bid = True
     place_ask = True
 
@@ -35,8 +35,14 @@ class TriangularXEMM(ScriptStrategyBase):
     fee_pair = "KCS-USDT"
     fee_asset_check_interval = 60
 
-    # kill_switch_enabled: bool = True
-    # kill_switch_rate = Decimal("-2")
+    kill_switch_enabled: bool = True
+    kill_switch_asset = "USDT"
+    kill_switch_rate = Decimal("-1")
+    kill_switch_check_interval = 60
+    kill_switch_counter_limit = 5
+
+    order_delay = 10
+    slippage_buffer = Decimal("1")
 
     # Class params
     status: str = "NOT_INIT"
@@ -55,6 +61,9 @@ class TriangularXEMM(ScriptStrategyBase):
     place_order_trials_delay = 5
     place_order_trials_limit = 10
     last_fee_asset_check_timestamp = 0
+    kill_switch_check_timestamp = 0
+    kill_switch_counter = 0
+    kill_switch_max_balance = Decimal("0")
 
     if fee_tracking_enabled:
         markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2, fee_pair}}
@@ -87,6 +96,12 @@ class TriangularXEMM(ScriptStrategyBase):
             if self.current_timestamp > self.last_fee_asset_check_timestamp + self.fee_asset_check_interval:
                 self.check_fee_asset()
                 self.last_fee_asset_check_timestamp = self.current_timestamp
+                return
+
+        if self.kill_switch_enabled:
+            if self.current_timestamp > self.kill_switch_check_timestamp + self.kill_switch_check_interval:
+                self.check_kill_switch()
+                self.kill_switch_check_timestamp = self.current_timestamp
                 return
 
         # check for balances
@@ -181,6 +196,26 @@ class TriangularXEMM(ScriptStrategyBase):
                 if place_result:
                     self.log_with_clock(logging.INFO, f"{fee_asset_diff_quantize} {self.fee_asset} "
                                                       f"on the {self.fee_pair} market was sold to adjust fees assets")
+
+    def check_kill_switch(self):
+        kill_switch_current_balance = self.connector.get_balance(self.kill_switch_asset)
+        self.log_with_clock(logging.WARNING, f"kill_switch_current_balance = {kill_switch_current_balance},"
+                                             f"kill_switch_max_balance = {self.kill_switch_max_balance}")
+        if kill_switch_current_balance < self.kill_switch_max_balance:
+            diff_pct = Decimal("100") * (kill_switch_current_balance / self.kill_switch_max_balance - Decimal("1"))
+            if diff_pct < self.kill_switch_rate:
+                if self.kill_switch_counter > self.kill_switch_counter_limit:
+                    msg = f"!!! Kill switch threshold reached. Stop trading!"
+                    self.notify_hb_app_with_timestamp(msg)
+                    self.log_with_clock(logging.WARNING, msg)
+                    self.status = "NOT_ACTIVE"
+                else:
+                    self.log_with_clock(logging.WARNING, f"diff_pct = {round(diff_pct, 2)}% less than "
+                                                         f"{self.kill_switch_rate}%. Counter = {self.kill_switch_counter}")
+                    self.kill_switch_counter += 1
+        else:
+            self.kill_switch_max_balance = kill_switch_current_balance
+            self.kill_switch_counter = 0
 
     def process_hedge(self):
         if len(self.taker_candidates) > 0:
