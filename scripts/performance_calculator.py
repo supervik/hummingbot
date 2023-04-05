@@ -16,13 +16,13 @@ class PerformanceCalculator(ScriptStrategyBase):
     # Config params
     connector_name: str = "binance"
     fake_pair = "SOL-USDT"
-    trades_folder = "real"
+    trades_folder = "test"
     ignore_asset = "KCS"
     group_by_day = True
 
     # time in seconds between trades to combine them into 1 round
     timestamp_threshold = 120
-    fee_pct = 0.08
+    fee_pct = 0.35
 
     markets = {connector_name: {fake_pair}}
 
@@ -70,7 +70,8 @@ class PerformanceCalculator(ScriptStrategyBase):
             self.log_with_clock(logging.INFO, f"df = {df}")
             self.log_with_clock(logging.INFO, f"all_assets = {all_assets}")
 
-        filename = f"profitability_{self.trades_file}"
-        path = os.path.join(data_path(), filename)
-        df.to_csv(path, index=False)
+            filename = f"profitability_{csv_file}"
+            path = os.path.join(work_folder, filename)
+            df.to_csv(path, index=True)
+
         HummingbotApplication.main_application().stop()
