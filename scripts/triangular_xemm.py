@@ -206,6 +206,7 @@ class TriangularXEMM(ScriptStrategyBase):
             if diff_pct < self.kill_switch_rate:
                 if self.kill_switch_counter > self.kill_switch_counter_limit:
                     msg = f"!!! Kill switch threshold reached. Stop trading!"
+                    self.cancel_all_orders()
                     self.notify_hb_app_with_timestamp(msg)
                     self.log_with_clock(logging.WARNING, msg)
                     self.status = "NOT_ACTIVE"
