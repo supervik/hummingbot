@@ -21,6 +21,8 @@ class TriangularXEMM(ScriptStrategyBase):
 
     order_amount: Decimal = Decimal("3")
     min_order_amount = Decimal("1")
+    leftover_bid_pct = Decimal("0")
+    leftover_ask_pct = Decimal("0")
 
     set_target_from_config = False
     target_base_amount = Decimal("0.01")
@@ -199,8 +201,8 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def check_kill_switch(self):
         kill_switch_current_balance = self.connector.get_balance(self.kill_switch_asset)
-        self.log_with_clock(logging.WARNING, f"kill_switch_current_balance = {kill_switch_current_balance},"
-                                             f"kill_switch_max_balance = {self.kill_switch_max_balance}")
+        # self.log_with_clock(logging.WARNING, f"kill_switch_current_balance = {kill_switch_current_balance},"
+        #                                      f"kill_switch_max_balance = {self.kill_switch_max_balance}")
         if kill_switch_current_balance < self.kill_switch_max_balance:
             diff_pct = Decimal("100") * (kill_switch_current_balance / self.kill_switch_max_balance - Decimal("1"))
             if diff_pct < self.kill_switch_rate:
@@ -373,6 +375,11 @@ class TriangularXEMM(ScriptStrategyBase):
                                 f"Can't create {candidate_adjusted.order_side.name}"
                                 f" {candidate_adjusted.order_type.name} order")
             return False
+
+        if candidate_adjusted.trading_pair == self.maker_pair:
+            leftover_pct = self.leftover_bid_pct if candidate_adjusted.order_side == TradeType.BUY else self.leftover_ask_pct
+            candidate_adjusted.amount *= Decimal("1") - leftover_pct / Decimal("100")
+            candidate_adjusted.amount = self.connector.quantize_order_amount(candidate_adjusted.trading_pair, candidate_adjusted.amount)
 
         self.place_order(candidate_adjusted)
         return True
