@@ -11,19 +11,26 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 class SpotPerpetualXEMM(ScriptStrategyBase):
     """
-
+    This script defines a cross-exchange market making strategy between spot and perpetual markets
+    - During each "tick", the bot checks if it's initialized and active.
+    - At appropriate times, the bot cleans up old maker order IDs.
+    - Bot calculates trade amounts based on the balance and the middle price.
+    - Checks if existing orders exceed the cancellation threshold and cancels them.
+    - Bot determines whether to place a buy or sell order based on base asset balance.
+    - The bot places maker orders with amounts that fit the budget.
+    - Upon successful order fulfillment, logs the event, and places a taker order.
+    - Taker orders are placed with adjusted amounts. If unable, the bot goes inactive.
     """
     # Config params
     maker_connector_name: str = "kucoin"
     taker_connector_name: str = "gate_io_perpetual"
     maker_pair: str = "IGU-USDT"
     taker_pair: str = "IGU-USDT"
-    # is_maker_spot = True
 
-    order_amount_in_quote = Decimal("2")
-    spread_bps = 60
-    min_spread_bps = 30
-    max_order_age = 120
+    order_amount_in_quote = Decimal("2")  # order amount for buying denominated in the base currency
+    spread_bps = 60  # profitability of the order
+    min_spread_bps = 30  # the min threshold after which the maker order is cancelled
+    max_order_age = 120  # the maximum order age after which the maker order is cancelled
 
     slippage_buffer_spread_bps = 200
     leverage = Decimal("20")
@@ -66,6 +73,7 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
 
     def on_tick(self):
         """
+        Manages operations performed during each strategy cycle
         """
         if self.status == "NOT_INIT":
             self.init_strategy()
@@ -90,17 +98,24 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         self.place_maker_orders()
 
     def init_strategy(self):
+        """
+        Initializes the strategy, defines the assets, and sets the bot to active.
+        """
         self.notify_hb_app_with_timestamp("Strategy started")
         self.set_base_quote_assets()
         self.status = "ACTIVE"
 
     def set_base_quote_assets(self):
         """
+        Sets base and quote assets for both maker and taker
         """
         self.maker_base_asset, self.maker_quote_asset = split_hb_trading_pair(self.maker_pair)
         self.taker_base_asset, self.taker_quote_asset = split_hb_trading_pair(self.taker_pair)
 
     def clean_maker_order_ids(self):
+        """
+        Cleans up old maker order IDs to avoid using expired ones
+        """
         updated_maker_order_ids = {}
         for order_id, timestamp in self.maker_order_ids.items():
             if timestamp > self.current_timestamp - self.maker_order_ids_clean_interval:
@@ -110,10 +125,16 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         self.maker_order_ids_clean_timestamp = self.current_timestamp + self.maker_order_ids_clean_interval
 
     def cancel_all_orders(self):
+        """
+        Cancels all active orders on the maker connector
+        """
         for order in self.get_active_orders(self.maker_connector_name):
             self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
 
     def calculate_maker_order_amount(self):
+        """
+        Calculates the maker order amount based on balance and order_amount_in_quote defined in the configuration
+        """
         # get sell amount
         base_amount = self.maker_connector.get_balance(self.maker_base_asset)
         self.sell_order_amount = self.quantize_amount_on_maker_and_taker(base_amount)
@@ -124,11 +145,17 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         self.buy_order_amount = self.quantize_amount_on_maker_and_taker(self.order_amount_in_base)
 
     def quantize_amount_on_maker_and_taker(self, amount):
+        """
+        Quantizes amounts for both maker and taker to match minimal requirements.
+        """
         amount_quantized_on_maker = self.maker_connector.quantize_order_amount(self.maker_pair, amount)
         amount_quantized_on_taker = self.taker_connector.quantize_order_amount(self.taker_pair, amount)
         return min(amount_quantized_on_maker, amount_quantized_on_taker)
 
     def calculate_taker_hedging_price(self):
+        """
+        Calculates the taker hedging price to be used for placing orders
+        """
         self.taker_sell_hedging_price = self.taker_connector.get_price_for_volume(self.taker_pair, False,
                                                                                   self.order_amount_in_base).result_price
         self.taker_buy_hedging_price = self.taker_connector.get_price_for_volume(self.taker_pair, True,
@@ -144,6 +171,9 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
             self.taker_sell_hedging_price -= mid_dif
 
     def check_existing_orders_for_cancellation(self):
+        """
+        Checks and cancels existing orders that exceed a threshold.
+        """
         self.buy_order_placed = False
         self.sell_order_placed = False
         for order in self.get_active_orders(connector_name=self.maker_connector_name):
@@ -162,9 +192,16 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
                     self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
 
     def get_maker_order_side(self):
+        """
+        Determines if the bot should place a buy or sell order
+        If there is enough base amount to sell it places a sell order
+        """
         self.maker_side = TradeType.BUY if self.sell_order_amount == Decimal("0") else TradeType.SELL
 
     def place_maker_orders(self):
+        """
+        Places maker orders based on the calculated parameters
+        """
         if self.buy_order_placed or self.sell_order_placed:
             return
 
@@ -180,43 +217,23 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
 
         maker_order_adjusted = self.maker_connector.budget_checker.adjust_candidate(maker_order, all_or_none=False)
         if maker_order_adjusted.amount != Decimal("0"):
-            order_id = self.send_order_to_exchange(candidate=maker_order_adjusted, connector_name=self.maker_connector_name)
+            order_id = self.send_order_to_exchange(candidate=maker_order_adjusted,
+                                                   connector_name=self.maker_connector_name)
             if order_id:
                 self.maker_order_ids[order_id] = self.current_timestamp
 
     def send_order_to_exchange(self, candidate, connector_name):
+        """
+        Sends a given order candidate to the exchange
+        """
         if candidate.order_side == TradeType.SELL:
             order_id = self.sell(connector_name, candidate.trading_pair, candidate.amount, candidate.order_type,
-                      candidate.price, PositionAction.OPEN)
+                                 candidate.price, PositionAction.OPEN)
         else:
             order_id = self.buy(connector_name, candidate.trading_pair, candidate.amount, candidate.order_type,
-                     candidate.price, PositionAction.OPEN)
+                                candidate.price, PositionAction.OPEN)
 
         return order_id
-
-    # def test_open_perpetual_order(self):
-    #     amount = Decimal("20")
-    #     taker_price = self.taker_connector.get_price_for_volume(self.taker_pair, True, amount).result_price
-    #     taker_price_with_slippage = taker_price * Decimal(1 + self.slippage_buffer_spread_bps / 10000)
-    #     self.logger().info(f"taker_price = {taker_price}, taker_price_with_slippage = {taker_price_with_slippage}")
-    #     taker_candidate = PerpetualOrderCandidate(trading_pair=self.taker_pair, is_maker=False,
-    #                                               order_type=OrderType.LIMIT,
-    #                                               order_side=TradeType.BUY, amount=amount,
-    #                                               price=taker_price_with_slippage, leverage=self.leverage)
-    #
-    #     taker_candidate_adjusted = self.taker_connector.budget_checker.adjust_candidate(taker_candidate,
-    #                                                                                     all_or_none=True)
-    #     if taker_candidate_adjusted.amount != Decimal("0"):
-    #         self.send_order_to_exchange(candidate=taker_candidate_adjusted, connector_name=self.taker_connector_name)
-    #         self.logger().info(f"send_order_to_exchange. Candidate adjusted {taker_candidate_adjusted}")
-    #
-    # def get_open_positions(self):
-    #     open_positions = self.taker_connector.account_positions
-    #     self.logger().info(f"open_positions = {open_positions}")
-    #     for key, position in open_positions.items():
-    #         self.logger().info(f"position = {position}")
-    #         position_amount = position.amount
-    #         self.logger().info(f"Current short_position_amount = {position_amount}")
 
     def is_active_maker_order(self, event: OrderFilledEvent):
         """
@@ -228,6 +245,9 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
             return False
 
     def did_fill_order(self, event: OrderFilledEvent):
+        """
+        Handles order fill events, logs them, and places corresponding taker orders
+        """
         exchange = "Taker"
         if self.is_active_maker_order(event):
             self.next_maker_order_timestamp = self.current_timestamp + self.order_delay
@@ -241,6 +261,9 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         self.notify_hb_app_with_timestamp(msg)
 
     def place_taker_orders(self):
+        """
+        Places taker orders based on the filled orders from the maker side
+        """
         amount_total = Decimal("0")
         for event in self.filled_event_buffer:
             amount_total += event.amount
