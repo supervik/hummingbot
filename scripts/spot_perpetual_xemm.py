@@ -24,7 +24,6 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
     # Config params
     maker_connector_name: str = "kucoin"
     taker_connector_name: str = "gate_io_perpetual"
-    # trading_pairs = {"AGIX-USDT", "AKRO-USDT", "BNB-USDT", "BSW-USDT", "BSW-USDT", "CAKE-USDT", "CELR-USDT"}
 
     trading_pairs = {"1INCH-USDT", "AAVE-USDT", "ACH-USDT", "ACS-USDT", "ADA-USDT", "AGIX-USDT", "AKRO-USDT",
                      "ALGO-USDT", "ANT-USDT", "APE-USDT", "APT-USDT", "ARB-USDT", "ARPA-USDT", "AR-USDT",
@@ -33,31 +32,12 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
                      "CETUS-USDT", "CFX-USDT", "CKB-USDT", "CLV-USDT", "COMP-USDT", "COTI-USDT",
                      "CREAM-USDT", "CRO-USDT", "CRV-USDT", "CSPR-USDT", "CTSI-USDT", "DAO-USDT"}
 
-    # trading_pairs = {"DASH-USDT", "DGB-USDT", "DOGE-USDT", "DOT-USDT", "DUSK-USDT", "DYDX-USDT", "EDU-USDT",
-    #                  "EGLD-USDT", "ENJ-USDT", "EOS-USDT", "ETC-USDT", "ETH-USDT", "ETHW-USDT", "FET-USDT", "FIL-USDT",
-    #                  "FITFI-USDT", "FLOKI-USDT", "FLOW-USDT", "FLR-USDT", "FLUX-USDT", "FTM-USDT", "FTT-USDT",
-    #                  "GAL-USDT", "GLMR-USDT", "GMT-USDT", "GMX-USDT", "GRT-USDT", "HBAR-USDT", "HFT-USDT", "HIFI-USDT",
-    #                  "HIGH-USDT", "HNT-USDT", "ICP-USDT", "ICX-USDT", "ID-USDT", "IGU-USDT", "IMX-USDT", "INJ-USDT",
-    #                  "IOTA-USDT", "IOTX-USDT", "JASMY-USDT", "JST-USDT"}
-    #
-    # trading_pairs = {"KAS-USDT", "KAVA-USDT", "KDA-USDT", "KLAY-USDT", "KSM-USDT", "LDO-USDT",
-    #                  "LINA-USDT", "LOOKS-USDT", "LUNA-USDT", "LUNC-USDT", "MAGIC-USDT",
-    #                  "MANA-USDT", "MASK-USDT", "MINA-USDT", "MKR-USDT", "MOVR-USDT", "MTL-USDT",
-    #                  "NEAR-USDT", "NKN-USDT", "OAS-USDT", "OCEAN-USDT", "OGN-USDT", "OMG-USDT", "ONE-USDT", "ONT-USDT",
-    #                  "OP-USDT", "ORDI-USDT", "POLS-USDT", "PROM-USDT", "QNT-USDT", "QRDO-USDT",
-    #                  "RDNT-USDT", "REN-USDT", "RNDR-USDT", "RSR-USDT"}
-
-    # trading_pairs = {"RUNE-USDT", "SAND-USDT", "SCRT-USDT", "SFP-USDT", "SHIB-USDT", "SLP-USDT", "SNX-USDT", "SOL-USDT",
-    #                  "SQUAD-USDT", "STORJ-USDT", "STX-USDT", "SUI-USDT", "SUN-USDT", "SUPER-USDT", "SUSHI-USDT",
-    #                  "SXP-USDT", "TFUEL-USDT", "THETA-USDT", "TON-USDT", "TRU-USDT",
-    #                  "UMA-USDT", "USDC-USDT", "USTC-USDT", "VELO-USDT", "VET-USDT", "VRA-USDT",
-    #                  "WAVES-USDT", "WEMIX-USDT", "WOO-USDT", "XCH-USDT", "XCN-USDT", "XLM-USDT", "XMR-USDT",
-    #                  "XRD-USDT", "XTZ-USDT", "YFI-USDT", "ZEC-USDT", "ZEN-USDT", "ZIL-USDT"}
-
     order_amount_in_quote = Decimal("2.5")  # order amount for buying denominated in the quote currency
-    spread_bps = 100  # profitability of the order
-    min_spread_bps = 60  # the min threshold after which the maker order is cancelled
-    max_order_age = 360  # the maximum order age after which the maker order is cancelled
+    buy_spread_bps = 150  # profitability of the buy order
+    min_buy_spread_bps = 100  # the min threshold after which the buy maker order is cancelled
+    sell_spread_bps = 100  # profitability of the sell order
+    min_sell_spread_bps = 50  # the min threshold after which the sell maker order is cancelled
+    max_order_age = 180  # the maximum order age after which the maker order is cancelled
 
     slippage_buffer_spread_bps = 200
     leverage = Decimal("20")
@@ -291,13 +271,13 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
                 cancel_timestamp = order.creation_timestamp / 1000000 + self.max_order_age
                 if order.is_buy:
                     self.buy_order_placed = True
-                    buy_cancel_threshold = self.taker_sell_hedging_price * Decimal(1 - self.min_spread_bps / 10000)
+                    buy_cancel_threshold = self.taker_sell_hedging_price * Decimal(1 - self.min_buy_spread_bps / 10000)
                     if order.price > buy_cancel_threshold or cancel_timestamp < self.current_timestamp:
                         self.logger().info(f"Cancelling {order.trading_pair} buy order {order.client_order_id}")
                         self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
                 else:
                     self.sell_order_placed = True
-                    sell_cancel_threshold = self.taker_buy_hedging_price * Decimal(1 + self.min_spread_bps / 10000)
+                    sell_cancel_threshold = self.taker_buy_hedging_price * Decimal(1 + self.min_sell_spread_bps / 10000)
                     if order.price < sell_cancel_threshold or cancel_timestamp < self.current_timestamp:
                         self.logger().info(f"Cancelling {order.trading_pair} sell order: {order.client_order_id}")
                         self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
@@ -317,10 +297,10 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
             return
 
         if self.maker_side == TradeType.BUY:
-            maker_price = self.taker_sell_hedging_price * Decimal(1 - self.spread_bps / 10000)
+            maker_price = self.taker_sell_hedging_price * Decimal(1 - self.buy_spread_bps / 10000)
             maker_order_amount = self.buy_order_amount
         else:
-            maker_price = self.taker_buy_hedging_price * Decimal(1 + self.spread_bps / 10000)
+            maker_price = self.taker_buy_hedging_price * Decimal(1 + self.sell_spread_bps / 10000)
             maker_order_amount = self.sell_order_amount
 
         maker_order = OrderCandidate(trading_pair=self.pair, is_maker=True, order_type=OrderType.LIMIT,
