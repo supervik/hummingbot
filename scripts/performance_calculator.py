@@ -14,15 +14,16 @@ class PerformanceCalculator(ScriptStrategyBase):
     """
     """
     # Config params
-    connector_name: str = "binance"
+    connector_name: str = "kucoin_paper_trade"
     fake_pair = "SOL-USDT"
     trades_folder = "test"
     ignore_asset = "KCS"
-    group_by_day = True
+    group_by_id = False  # whether group by trade round or base_asset
+    group_by_day = False
 
     # time in seconds between trades to combine them into 1 round
-    timestamp_threshold = 120
-    fee_pct = 0.35
+    timestamp_threshold = 10
+    fee_pct = 0.11
 
     markets = {connector_name: {fake_pair}}
 
@@ -41,7 +42,7 @@ class PerformanceCalculator(ScriptStrategyBase):
             base_assets = df['base_asset'].unique().tolist()
             quote_assets = df['quote_asset'].unique().tolist()
             all_assets = set(base_assets + quote_assets)
-            self.log_with_clock(logging.INFO, f"all_assets = {all_assets}")
+
             for asset in all_assets:
                 conditions = [(df['base_asset'] == asset) & (df['trade_type'] == "BUY"),
                               (df['base_asset'] == asset) & (df['trade_type'] == "SELL"),
@@ -51,15 +52,20 @@ class PerformanceCalculator(ScriptStrategyBase):
                            -df.amount * df.price * (1 + self.fee_pct / 100),
                            df.amount * df.price * (1 - self.fee_pct / 100)]
                 df[asset] = np.select(conditions, choices, default=0)
-            df = df.groupby('id', as_index=False).sum()
-            df['time'] = pd.to_datetime(df['id'], unit='ms')
-            df['time'] = df['time'].dt.floor('S')
 
-            columns = ["id", "time"] + list(all_assets)
+            if self.group_by_id:
+                df = df.groupby('id', as_index=False).sum()
+                df['time'] = pd.to_datetime(df['id'], unit='ms')
+                df['time'] = df['time'].dt.floor('S')
+                columns = ["id", "time"] + list(all_assets)
+            else:
+                df = df.groupby(['base_asset', 'id'], as_index=False).sum()
+                columns = ["id", "base_asset"] + list(all_assets)
+
             self.log_with_clock(logging.INFO, f"columns = {columns}")
             df = df[columns]
 
-            if self.group_by_day:
+            if self.group_by_id and self.group_by_day:
                 if len(columns) == 5:
                     df = df.groupby([df['time'].dt.date]).agg({columns[1]: 'count', columns[2]: 'sum',
                                                                columns[3]: 'sum', columns[4]: 'sum'})
@@ -68,10 +74,8 @@ class PerformanceCalculator(ScriptStrategyBase):
                                                                columns[3]: 'sum'})
 
             self.log_with_clock(logging.INFO, f"df = {df}")
-            self.log_with_clock(logging.INFO, f"all_assets = {all_assets}")
 
-            filename = f"profitability_{csv_file}"
-            path = os.path.join(work_folder, filename)
-            df.to_csv(path, index=True)
+            filename = f"profitability_{csv_file}.xlsx"
+            df.to_excel(os.path.join(work_folder, filename))
 
         HummingbotApplication.main_application().stop()
