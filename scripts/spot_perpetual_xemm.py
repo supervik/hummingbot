@@ -25,25 +25,21 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
     maker_connector_name: str = "kucoin"
     taker_connector_name: str = "gate_io_perpetual"
 
-    trading_pairs = {"1INCH-USDT", "AAVE-USDT", "ACH-USDT", "ACS-USDT", "ADA-USDT", "AGIX-USDT", "AKRO-USDT",
-                     "ALGO-USDT", "ANT-USDT", "APE-USDT", "APT-USDT", "ARB-USDT", "ARPA-USDT", "AR-USDT",
-                     "ASTRA-USDT", "ASTR-USDT", "AXS-USDT", "BAND-USDT", "BCH-USDT",
-                     "BLUR-USDT", "BNB-USDT", "BSW-USDT", "CAKE-USDT", "CELR-USDT",
-                     "CETUS-USDT", "CFX-USDT", "CKB-USDT", "CLV-USDT", "COMP-USDT", "COTI-USDT",
-                     "CREAM-USDT", "CRO-USDT", "CRV-USDT", "CSPR-USDT", "CTSI-USDT", "DAO-USDT"}
+    trading_pairs = {"KAVA-USDT", "FTT-USDT", "SQUAD-USDT", "VET-USDT", "VELO-USDT"}
 
-    order_amount_in_quote = Decimal("2.5")  # order amount for buying denominated in the quote currency
-    buy_spread_bps = 150  # profitability of the buy order
-    min_buy_spread_bps = 100  # the min threshold after which the buy maker order is cancelled
+    order_amount_in_quote = Decimal("20")  # order amount for buying denominated in the quote currency
+    buy_spread_bps = 200  # profitability of the buy order
+    min_buy_spread_bps = 150  # the min threshold after which the buy maker order is cancelled
     sell_spread_bps = 100  # profitability of the sell order
-    min_sell_spread_bps = 50  # the min threshold after which the sell maker order is cancelled
-    max_order_age = 180  # the maximum order age after which the maker order is cancelled
+    min_sell_spread_bps = 70  # the min threshold after which the sell maker order is cancelled
+    max_order_age = 120  # the maximum order age after which the maker order is cancelled
 
-    slippage_buffer_spread_bps = 200
+    slippage_buffer_spread_bps = 300
     leverage = Decimal("20")
 
     dry_run = False
-    close_all_positions = True
+    close_all_positions = False
+    add_safety_mid_prices_dif_for_hedge = False
 
     # class parameters
     status = "NOT_INIT"
@@ -208,13 +204,20 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         self.maker_order_ids = updated_maker_order_ids
         self.maker_order_ids_clean_timestamp = self.current_timestamp + self.maker_order_ids_clean_interval
 
-    def cancel_all_orders(self, trading_pair):
+    def cancel_all_orders_on_trading_pair(self, trading_pair):
         """
         Cancels all active orders on the maker connector
         """
         for order in self.get_active_orders(self.maker_connector_name):
             if trading_pair == order.trading_pair:
                 self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
+
+    def cancel_all_orders(self):
+        """
+        Cancels all active orders on the maker connector
+        """
+        for order in self.get_active_orders(self.maker_connector_name):
+            self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
 
     def calculate_maker_order_amount(self):
         """
@@ -250,15 +253,19 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
                                                                                   self.order_amount_in_base).result_price
         self.taker_buy_hedging_price = self.taker_connector.get_price_for_volume(self.pair, True,
                                                                                  self.order_amount_in_base).result_price
-        mid_taker_price = (self.taker_sell_hedging_price + self.taker_buy_hedging_price) / 2
-        mid_maker_price = self.maker_connector.get_mid_price(self.pair)
+        if self.add_safety_mid_prices_dif_for_hedge:
+            mid_taker_price = (self.taker_sell_hedging_price + self.taker_sell_hedging_price) / 2
+            mid_maker_price = self.maker_connector.get_mid_price(self.pair)
 
-        mid_dif = mid_taker_price - mid_maker_price
-        try:
-            if mid_dif > Decimal("0"):
-                self.taker_sell_hedging_price -= mid_dif
-        except:
-            self.logger().info(f"{self.pair} mid_taker_price = {mid_taker_price}, mid_maker_price = {mid_maker_price} ")
+            mid_dif = mid_taker_price - mid_maker_price
+            try:
+                if mid_dif > Decimal("0"):
+                    self.taker_sell_hedging_price -= mid_dif
+            except:
+                self.logger().info(f"Can't calculate mid_dif for {self.pair} "
+                                   f"mid_taker_price = {mid_taker_price}, mid_maker_price = {mid_maker_price}, "
+                                   f"taker_sell_hedging_price = {self.taker_sell_hedging_price}, "
+                                   f"taker_buy_hedging_price = {self.taker_buy_hedging_price}")
 
     def check_existing_orders_for_cancellation(self):
         """
@@ -384,6 +391,9 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
                     short_position_amount = abs(position.amount)
                     self.logger().info(f"Current short_position_amount on {trading_pair} = {short_position_amount}")
 
+            if short_position_amount == Decimal("0"):
+                self.logger().info(f"There is no open short positions on {trading_pair}")
+                return
             taker_side = TradeType.BUY
             taker_amount = min(short_position_amount, amount_total)
             taker_price = self.taker_connector.get_price_for_volume(trading_pair, True, taker_amount).result_price
@@ -406,6 +416,7 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         else:
             self.notify_app_and_log(f"Can't create taker order with {taker_candidate.amount} amount on {trading_pair} "
                                     f"Check minimum amount requirement or balance")
+            self.cancel_all_orders()
             self.status = "NOT_ACTIVE"
 
     def format_status(self) -> str:
