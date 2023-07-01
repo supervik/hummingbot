@@ -18,12 +18,14 @@ class PerformanceCalculator(ScriptStrategyBase):
     fake_pair = "SOL-USDT"
     trades_folder = "test"
     ignore_asset = "KCS"
-    group_by_id = False  # whether group by trade round or base_asset
+
+    # group by base asset and id (for multi pairs) or id only (trade round for simple/tri xemm)
+    group_by_base_asset = True
     group_by_day = False
 
     # time in seconds between trades to combine them into 1 round
     timestamp_threshold = 10
-    fee_pct = 0.11
+    fee_pct = 0.12
 
     markets = {connector_name: {fake_pair}}
 
@@ -53,19 +55,19 @@ class PerformanceCalculator(ScriptStrategyBase):
                            df.amount * df.price * (1 - self.fee_pct / 100)]
                 df[asset] = np.select(conditions, choices, default=0)
 
-            if self.group_by_id:
+            if self.group_by_base_asset:
+                df = df.groupby(['base_asset', 'id'], as_index=False).sum()
+                columns = ["id", "base_asset"] + list(all_assets)
+            else:
                 df = df.groupby('id', as_index=False).sum()
                 df['time'] = pd.to_datetime(df['id'], unit='ms')
                 df['time'] = df['time'].dt.floor('S')
                 columns = ["id", "time"] + list(all_assets)
-            else:
-                df = df.groupby(['base_asset', 'id'], as_index=False).sum()
-                columns = ["id", "base_asset"] + list(all_assets)
 
             self.log_with_clock(logging.INFO, f"columns = {columns}")
             df = df[columns]
 
-            if self.group_by_id and self.group_by_day:
+            if not self.group_by_base_asset and self.group_by_day:
                 if len(columns) == 5:
                     df = df.groupby([df['time'].dt.date]).agg({columns[1]: 'count', columns[2]: 'sum',
                                                                columns[3]: 'sum', columns[4]: 'sum'})
