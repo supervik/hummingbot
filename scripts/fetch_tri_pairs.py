@@ -9,13 +9,14 @@ from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
 
 
 class FetchTriPairs(ScriptStrategyBase):
     # Config params
-    connector_name: str = "kucoin"
-    trading_pair = "XMR-ETH"
+    connector_name: str = "binance"
+    trading_pair = "XMR-USDT"
     quote_assets_reverse = False
     url = "https://api.kucoin.com/api/v1/market/allTickers"
 
@@ -44,7 +45,7 @@ class FetchTriPairs(ScriptStrategyBase):
     pairs_data = {}
 
     markets = {connector_name: {trading_pair}}
-
+    pairs = ""
 
     @property
     def connector(self):
@@ -198,14 +199,21 @@ class FetchTriPairs(ScriptStrategyBase):
         self.create_pairs_data()
         self.create_triangles()
 
+    async def call_fetch_pairs(self):
+        self.pairs = await self.connector.all_trading_pairs()
+
     def on_tick(self):
         if self.status == "NOT_INIT":
-            self.strategy_init()
+            safe_ensure_future(self.call_fetch_pairs())
+            # all_pairs = safe_ensure_future(self.call_fetch_pairs())
+            self.log_with_clock(logging.INFO, f"all_pairs {self.pairs}")
+            # self.strategy_init()
             self.status = "READY"
         # self.log_with_clock(logging.INFO, "New tick")
 
-        if not self.get_pairs_data():
+        if not self.pairs:
             return
+        self.log_with_clock(logging.INFO, f"all_pairs {self.pairs}")
 
         for cross_pair, base_assets in self.triangles.items():
             quote_1, quote_2 = split_hb_trading_pair(cross_pair)
