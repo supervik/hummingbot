@@ -13,19 +13,20 @@ class HedgePerpetual(ScriptStrategyBase):
     # Config params
     maker_connector_name: str = "gate_io"
     taker_connector_name: str = "gate_io_perpetual"
-    maker_pair: str = "ASTRA-USDT"
-    taker_pair: str = "ASTRA-USDT"
+    maker_pair: str = "IGU-USDT"
+    taker_pair: str = "IGU-USDT"
     is_maker_spot = True
-    open_hedge = True
+    open_hedge = False
 
     max_order_amount = Decimal("100")
-    total_amount = Decimal("200")
+    total_amount = Decimal("100")
+    kill_switch_balance = Decimal("100")
     processed_amount = Decimal("0")
     processed_amount_quote = Decimal("0")
 
-    min_spread_bps = 0
-    spread_bps = 10
-    max_order_age = 300
+    min_spread_bps = 100
+    spread_bps = 200
+    max_order_age = 120
 
     slippage_buffer_spread_bps = 100
     leverage = Decimal("20")
@@ -65,6 +66,9 @@ class HedgePerpetual(ScriptStrategyBase):
         if self.status == "NOT_ACTIVE":
             return
 
+        if self.check_kill_switch_balance():
+            return
+        
         self.calculate_maker_order_amount()
 
         self.calculate_taker_hedging_price()
@@ -75,6 +79,22 @@ class HedgePerpetual(ScriptStrategyBase):
 
     def init_strategy(self):
         self.buy_on_maker = False if self.is_maker_spot ^ self.open_hedge else True
+        self.status = "ACTIVE"
+
+    def check_kill_switch_balance(self):
+        if self.buy_on_maker:
+            base_asset, quote_asset = self.maker_pair.split("-")
+            base_amount = self.maker_connector.get_balance(base_asset)
+            if base_amount >= self.kill_switch_balance:
+                self.logger().info(f"Kill switch balance reached. Stop trading")
+                self.cancel_all_orders()
+                self.status = "NOT_ACTIVE"
+                return True
+        return False
+
+    def cancel_all_orders(self):
+        for order in self.get_active_orders(self.maker_connector_name):
+            self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
 
     def calculate_maker_order_amount(self):
         amount_left = self.total_amount - self.processed_amount
@@ -92,6 +112,17 @@ class HedgePerpetual(ScriptStrategyBase):
                                                                                   self.maker_order_amount).result_price
         self.taker_buy_hedging_price = self.taker_connector.get_price_for_volume(self.taker_pair, True,
                                                                                  self.maker_order_amount).result_price
+        mid_maker_price = self.maker_connector.get_mid_price(self.maker_pair)
+        mid_taker_price = (self.taker_sell_hedging_price + self.taker_buy_hedging_price) / 2
+        mid_dif = mid_taker_price - mid_maker_price
+        # self.logger().info(
+        #     f"mid_maker_price = {mid_maker_price} mid_taker_price = {mid_taker_price}, mid_dif = {mid_dif}, "
+        #     f"self.taker_sell_hedging_price = {self.taker_sell_hedging_price}")
+        if mid_dif > 0 and self.open_hedge and self.buy_on_maker:
+            self.taker_sell_hedging_price -= mid_dif
+            # self.logger().info(f"Shifted self.taker_sell_hedging_price = {self.taker_sell_hedging_price}")
+        if mid_dif < 0 and self.open_hedge and not self.buy_on_maker:
+            self.taker_buy_hedging_price += abs(mid_dif)
 
     def check_existing_orders_for_cancellation(self):
         self.buy_order_placed = False
@@ -149,9 +180,12 @@ class HedgePerpetual(ScriptStrategyBase):
         """
         Helper function that checks if order is an active order on the maker exchange
         """
-        for order in self.get_active_orders(connector_name=self.maker_connector_name):
-            if order.client_order_id == event.order_id:
-                return True
+        # for order in self.get_active_orders(connector_name=self.maker_connector_name):
+        #     if order.client_order_id == event.order_id:
+        #         return True
+        if (event.trade_type == TradeType.BUY and self.buy_on_maker) or \
+                (event.trade_type == TradeType.SELL and not self.buy_on_maker):
+            return True
         return False
 
     def did_fill_order(self, event: OrderFilledEvent):
@@ -169,39 +203,36 @@ class HedgePerpetual(ScriptStrategyBase):
         self.notify_hb_app_with_timestamp(msg)
 
     def place_taker_orders(self):
-        amount_total = 0
+        amount_total = Decimal("0")
         for event in self.filled_event_buffer:
-            if event.trade_type == TradeType.BUY:
-                amount_total += event.amount
-            else:
-                amount_total -= event.amount
-        taker_amount = Decimal(abs(amount_total))
-        self.logger().info(f"taker_amount = {taker_amount}")
-        quantized_taker_amount = self.taker_connector.quantize_order_amount(self.taker_pair, taker_amount)
-        if quantized_taker_amount == Decimal("0"):
+            amount_total += event.amount
+    
+        self.logger().info(f"amount_total = {amount_total}")
+        quantized_amount_total = self.taker_connector.quantize_order_amount(self.taker_pair, amount_total)
+        if quantized_amount_total == Decimal("0"):
             self.logger().info(f"Not enough amount filled to open a hedge order")
             return
 
-        if amount_total > 0:
+        if self.buy_on_maker:
             taker_side = TradeType.SELL
-            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, False, taker_amount).result_price
+            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, False, quantized_amount_total).result_price
             taker_price_with_slippage = taker_price * Decimal(1 - self.slippage_buffer_spread_bps / 10000)
             self.logger().info(f"Sending sell on taker with price {taker_price}")
         else:
             taker_side = TradeType.BUY
-            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, True, taker_amount).result_price
+            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, True, quantized_amount_total).result_price
             taker_price_with_slippage = taker_price * Decimal(1 + self.slippage_buffer_spread_bps / 10000)
             self.logger().info(f"Sending buy on taker with price {taker_price}")
 
         if self.is_maker_spot:
             taker_candidate = PerpetualOrderCandidate(trading_pair=self.taker_pair, is_maker=False,
                                                       order_type=OrderType.LIMIT,
-                                                      order_side=taker_side, amount=taker_amount,
+                                                      order_side=taker_side, amount=amount_total,
                                                       price=taker_price_with_slippage, leverage=self.leverage)
 
         else:
             taker_candidate = OrderCandidate(trading_pair=self.taker_pair, is_maker=False, order_type=OrderType.LIMIT,
-                                             order_side=taker_side, amount=taker_amount,
+                                             order_side=taker_side, amount=amount_total,
                                              price=taker_price_with_slippage)
 
         taker_candidate_adjusted = self.taker_connector.budget_checker.adjust_candidate(taker_candidate,
@@ -216,7 +247,7 @@ class HedgePerpetual(ScriptStrategyBase):
             msg = f"Can't create taker order with {taker_candidate.amount} amount. Check minimum amount requirement or balance"
             self.logger().info(msg)
             self.notify_hb_app_with_timestamp(msg)
-            HummingbotApplication.main_application().stop()
+            self.status = "NOT_ACTIVE"
 
     def active_orders_df(self) -> pd.DataFrame:
         """
