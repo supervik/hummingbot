@@ -16,15 +16,16 @@ class XEMMVik(ScriptStrategyBase):
     """
     """
     maker_exchange = "kucoin"
-    maker_pair = "DFYN-USDT"
+    maker_pair = "ROUTE-USDT"
     taker_exchange = "gate_io"
-    taker_pair = "DFYN-USDT"
+    taker_pair = "ROUTE-USDT"
 
-    order_amount = 6400
-    min_order_amount = 400
-    spread_bps = 50  # bot places maker orders at this spread to taker price
-    min_spread_bps = 30  # bot refreshes order if spread is lower than min-spread
+    order_amount = 81
+    min_order_amount = 20
+    spread_bps = 80  # bot places maker orders at this spread to taker price
+    min_spread_bps = 50  # bot refreshes order if spread is lower than min-spread
     slippage_buffer_spread_bps = 100  # buffer applied to limit taker hedging trades on taker exchange
+    order_delay = 20
     max_order_age = 180  # bot refreshes orders after this age
 
     markets = {maker_exchange: {maker_pair}, taker_exchange: {taker_pair}}
@@ -32,6 +33,8 @@ class XEMMVik(ScriptStrategyBase):
     status = "ACTIVE"
     buy_order_placed = False
     sell_order_placed = False
+    open_sell = False
+    open_buy = False
     taker_buy_hedging_price = 0
     taker_sell_hedging_price = 0
     buy_order_amount = 0
@@ -40,6 +43,7 @@ class XEMMVik(ScriptStrategyBase):
     taker_candidate_buffer = []
     place_order_trials_delay = 5
     place_order_trials_limit = 10
+    next_maker_order_timestamp = 0
 
     @property
     def maker_connector(self):
@@ -54,18 +58,18 @@ class XEMMVik(ScriptStrategyBase):
         if self.status == "NOT_ACTIVE":
             return
 
-        if self.not_filled_taker_orders():
+        if self.status == "HEDGE":
+            self.not_filled_taker_orders()
             return
-
-        # self.check_balances()
-
-        # self.check_fee_assets()
 
         self.calculate_order_amount()
 
         self.calculate_hedging_price()
 
         self.check_existing_orders_for_cancellation()
+
+        if self.current_timestamp < self.next_maker_order_timestamp:
+            return
 
         self.place_maker_orders()
 
@@ -88,11 +92,15 @@ class XEMMVik(ScriptStrategyBase):
                     return True
 
                 self.log_with_clock(logging.INFO, f"Failed to place {candidate['order_candidate'].trading_pair}"
-                                                  f" {candidate['order_candidate'].order_side} order. "
+                                                  f" {candidate['order_candidate'].order_side} order. Trying again. "
                                                   f"Trial number {candidate['trials']}")
-                self.send_order_to_exchange(exchange=self.taker_exchange, candidate=candidate['order_candidate'])
-                self.taker_candidates[i]["sent_timestamp"] = self.current_timestamp
-                self.taker_candidates[i]["trials"] += 1
+                self.taker_candidate_buffer[i]["sent_timestamp"] = self.current_timestamp
+                self.taker_candidate_buffer[i]["trials"] += 1
+                order_id = self.send_order_to_exchange(exchange=self.taker_exchange, candidate=candidate['order_candidate'])
+                self.logger().info(f"New trial to send_order_to_exchange order_id = {order_id}")
+                if order_id:
+                    self.logger().info(f"Clear taker_candidate_buffer: {self.taker_candidate_buffer[i]}")
+                    self.taker_candidate_buffer.pop(i)
 
             return True
 
@@ -100,9 +108,19 @@ class XEMMVik(ScriptStrategyBase):
         base_asset, quote_asset = split_hb_trading_pair(self.maker_pair)
         base_taker_balance = self.taker_connector.get_available_balance(base_asset)
         quote_taker_balance = self.taker_connector.get_available_balance(quote_asset)
-        taker_price = self.taker_connector.get_price_for_volume(self.taker_pair, True, self.order_amount).result_price
+        base_maker_balance = self.maker_connector.get_available_balance(base_asset)
+        base_maker_balance_quantized = self.maker_connector.quantize_order_amount(self.maker_pair, base_maker_balance)
+        if base_maker_balance_quantized > self.min_order_amount:
+            self.open_sell = True
+            self.open_buy = False
+        else:
+            self.open_sell = True
+            self.open_buy = True
+
+        taker_buy_price = self.taker_connector.get_price_for_volume(self.taker_pair, True, self.order_amount).result_price
+        taker_buy_price_with_slippage = taker_buy_price * Decimal(1 + self.slippage_buffer_spread_bps / 10000)
         self.buy_order_amount = min(base_taker_balance, self.order_amount)
-        self.sell_order_amount = min(quote_taker_balance / taker_price, self.order_amount)
+        self.sell_order_amount = min(quote_taker_balance / taker_buy_price_with_slippage, self.order_amount)
 
     def calculate_hedging_price(self):
         self.taker_buy_hedging_price = self.taker_connector.get_price_for_volume(self.taker_pair, True,
@@ -129,7 +147,7 @@ class XEMMVik(ScriptStrategyBase):
                     self.cancel(self.maker_exchange, order.trading_pair, order.client_order_id)
 
     def place_maker_orders(self):
-        if not self.buy_order_placed:
+        if not self.buy_order_placed and self.open_buy:
             maker_buy_price = self.taker_sell_hedging_price * Decimal(1 - self.spread_bps / 10000)
             buy_order = OrderCandidate(trading_pair=self.maker_pair,
                                        is_maker=True,
@@ -143,7 +161,7 @@ class XEMMVik(ScriptStrategyBase):
             if buy_order_adjusted.amount != Decimal("0") and buy_order_adjusted.amount > self.min_order_amount:
                 self.send_order_to_exchange(exchange=self.maker_exchange, candidate=buy_order_adjusted)
 
-        if not self.sell_order_placed:
+        if not self.sell_order_placed and self.open_sell:
             maker_sell_price = self.taker_buy_hedging_price * Decimal(1 + self.spread_bps / 10000)
             amount = Decimal("0.995") * self.sell_order_amount
             sell_order = OrderCandidate(trading_pair=self.maker_pair,
@@ -163,38 +181,32 @@ class XEMMVik(ScriptStrategyBase):
             self.cancel(self.maker_exchange, order.trading_pair, order.client_order_id)
 
     def did_fill_order(self, event: OrderFilledEvent):
-        base_asset, quote_asset = split_hb_trading_pair(self.maker_pair)
-        balance_base = self.maker_connector.get_balance(base_asset)
-        self.logger().info(f"balance_base = {balance_base}")
         if self.is_active_maker_order(event):
-            filled_order_exchange = "--- Maker"
             self.filled_event_buffer.append(event)
             self.logger().info(f"New filled event was added to filled_event_buffer = {self.filled_event_buffer}")
+            self.next_maker_order_timestamp = self.current_timestamp + self.order_delay
             self.place_taker_order()
-        else:
-            filled_order_exchange = "Taker"
-            self.check_and_remove_taker_candidates(event, event.trade_type)
-            # self.cancel_all_orders()
-            # self.status = "NOT_ACTIVE"
-
-        msg = (f"{filled_order_exchange} {event.trade_type.name} {round(event.amount, 6)} {event.trading_pair} "
-               f"at {round(event.price, 6)}")
-        self.logger().info(msg)
-        self.notify_hb_app_with_timestamp(msg)
+            msg = (f"--> {event.trade_type.name} at price {round(event.price, 6)} maker order filled "
+                   f"with amount {round(event.amount, 6)} on {event.trading_pair}")
+            self.logger().info(msg)
+            self.notify_hb_app_with_timestamp(msg)
 
     def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
-        complete_price = event.quote_asset_amount / event.base_asset_amount
-        msg = f"*** Completed BUY order at price {complete_price}"
-        self.logger().info(msg)
-        self.notify_hb_app_with_timestamp(msg)
+        if not self.is_active_maker_order(event):
+            self.taker_completed_order_process(event, "BUY")
 
     def did_complete_sell_order(self, event: SellOrderCompletedEvent):
+        if not self.is_active_maker_order(event):
+            self.taker_completed_order_process(event, "SELL")
+
+    def taker_completed_order_process(self, event, side):
         complete_price = event.quote_asset_amount / event.base_asset_amount
-        msg = f"*** Completed SELL order at price {complete_price}"
+        msg = f"<<< {side} at price {complete_price} taker order completed with amount {event.base_asset_amount}"
         self.logger().info(msg)
         self.notify_hb_app_with_timestamp(msg)
+        self.status = "ACTIVE"
 
-    def is_active_maker_order(self, event: OrderFilledEvent):
+    def is_active_maker_order(self, event):
         """
         Helper function that checks if order is an active order on the maker exchange
         """
@@ -229,11 +241,20 @@ class XEMMVik(ScriptStrategyBase):
                                                                                         all_or_none=True)
 
         if taker_candidate_adjusted.amount != Decimal("0"):
-            self.taker_candidate_buffer.append({"order_candidate": taker_candidate_adjusted,
-                                                "sent_timestamp": self.current_timestamp, "trials": 0})
-            self.send_order_to_exchange(exchange=self.taker_exchange, candidate=taker_candidate_adjusted)
+            self.status = "HEDGE"
             self.logger().info(f"Delete all events from filled_event_buffer")
             self.filled_event_buffer = []
+            self.taker_candidate_buffer.append({"order_candidate": taker_candidate_adjusted,
+                                                "sent_timestamp": self.current_timestamp, "trials": 0})
+            self.logger().info(
+                f"Add new taker_candidate_buffer self.taker_candidate_buffer={self.taker_candidate_buffer}")
+            order_id = self.send_order_to_exchange(exchange=self.taker_exchange, candidate=taker_candidate_adjusted)
+            self.logger().info(f"send_order_to_exchange order_id = {order_id}")
+            if order_id:
+                self.logger().info(f"Clear taker_candidate_buffer: {self.taker_candidate_buffer[-1]}")
+                self.taker_candidate_buffer.pop(-1)
+            else:
+                self.logger().info(f"Order_id is not defined. Try to send order to exchange again")
         else:
             msg = f"Can't create taker order with {taker_candidate.amount} amount. Check minimum amount requirement or balance"
             self.logger().info(msg)
@@ -241,26 +262,10 @@ class XEMMVik(ScriptStrategyBase):
 
     def send_order_to_exchange(self, exchange, candidate):
         if candidate.order_side == TradeType.SELL:
-            self.sell(exchange, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
+            order_id = self.sell(exchange, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
         else:
-            self.buy(exchange, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
-
-    def did_create_buy_order(self, event: BuyOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"Buy order is created on the market {event.trading_pair}")
-        self.check_and_remove_taker_candidates(event, TradeType.BUY)
-
-    def did_create_sell_order(self, event: SellOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"Sell order is created on the market {event.trading_pair}")
-        self.check_and_remove_taker_candidates(event, TradeType.SELL)
-
-    def check_and_remove_taker_candidates(self, filled_event, trade_type):
-        candidates = self.taker_candidate_buffer.copy()
-        for i, candidate in enumerate(candidates):
-            if candidate["order_candidate"].order_side == trade_type and \
-                    math.isclose(candidate["order_candidate"].amount, filled_event.amount, rel_tol=1E-5):
-                self.log_with_clock(logging.INFO, f"Remove order candidate {candidate}")
-                self.taker_candidate_buffer.pop(i)
-                break
+            order_id = self.buy(exchange, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
+        return order_id
 
     def active_orders_df(self) -> pd.DataFrame:
         """
