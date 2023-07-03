@@ -16,17 +16,18 @@ class XEMMVik(ScriptStrategyBase):
     """
     """
     maker_exchange = "kucoin"
-    maker_pair = "ROUTE-USDT"
+    maker_pair = "IGU-USDT"
     taker_exchange = "gate_io"
-    taker_pair = "ROUTE-USDT"
+    taker_pair = "IGU-USDT"
 
-    order_amount = 81
-    min_order_amount = 20
-    spread_bps = 80  # bot places maker orders at this spread to taker price
-    min_spread_bps = 50  # bot refreshes order if spread is lower than min-spread
-    slippage_buffer_spread_bps = 100  # buffer applied to limit taker hedging trades on taker exchange
-    order_delay = 20
+    order_amount = 50
+    min_order_amount = 25
+    spread_bps = 120  # bot places maker orders at this spread to taker price
+    min_spread_bps = 80  # bot refreshes order if spread is lower than min-spread
+    slippage_buffer_spread_bps = 150  # buffer applied to limit taker hedging trades on taker exchange
+    order_delay = 30
     max_order_age = 180  # bot refreshes orders after this age
+    dry_run = False
 
     markets = {maker_exchange: {maker_pair}, taker_exchange: {taker_pair}}
 
@@ -44,6 +45,9 @@ class XEMMVik(ScriptStrategyBase):
     place_order_trials_delay = 5
     place_order_trials_limit = 10
     next_maker_order_timestamp = 0
+    maker_order_ids = {}
+    maker_order_ids_clean_interval = 30 * 60
+    maker_order_ids_clean_timestamp = 0
 
     @property
     def maker_connector(self):
@@ -61,6 +65,9 @@ class XEMMVik(ScriptStrategyBase):
         if self.status == "HEDGE":
             self.not_filled_taker_orders()
             return
+
+        if self.current_timestamp > self.maker_order_ids_clean_timestamp:
+            self.clean_maker_order_ids()
 
         self.calculate_order_amount()
 
@@ -159,7 +166,9 @@ class XEMMVik(ScriptStrategyBase):
             amount_less = buy_order_adjusted.amount * Decimal("0.999")
             buy_order_adjusted.amount = self.maker_connector.quantize_order_amount(self.maker_pair, amount_less)
             if buy_order_adjusted.amount != Decimal("0") and buy_order_adjusted.amount > self.min_order_amount:
-                self.send_order_to_exchange(exchange=self.maker_exchange, candidate=buy_order_adjusted)
+                order_id = self.send_order_to_exchange(exchange=self.maker_exchange, candidate=buy_order_adjusted)
+                if order_id:
+                    self.maker_order_ids[order_id] = self.current_timestamp
 
         if not self.sell_order_placed and self.open_sell:
             maker_sell_price = self.taker_buy_hedging_price * Decimal(1 + self.spread_bps / 10000)
@@ -174,7 +183,9 @@ class XEMMVik(ScriptStrategyBase):
             amount_less = sell_order_adjusted.amount * Decimal("0.999")
             sell_order_adjusted.amount = self.maker_connector.quantize_order_amount(self.maker_pair, amount_less)
             if sell_order_adjusted.amount != Decimal("0") and sell_order_adjusted.amount > self.min_order_amount:
-                self.send_order_to_exchange(exchange=self.maker_exchange, candidate=sell_order_adjusted)
+                order_id = self.send_order_to_exchange(exchange=self.maker_exchange, candidate=sell_order_adjusted)
+                if order_id:
+                    self.maker_order_ids[order_id] = self.current_timestamp
 
     def cancel_all_orders(self):
         for order in self.get_active_orders(self.maker_exchange):
@@ -206,14 +217,23 @@ class XEMMVik(ScriptStrategyBase):
         self.notify_hb_app_with_timestamp(msg)
         self.status = "ACTIVE"
 
-    def is_active_maker_order(self, event):
+    def is_active_maker_order(self, event: OrderFilledEvent):
         """
         Helper function that checks if order is an active order on the maker exchange
         """
-        for order in self.get_active_orders(connector_name=self.maker_exchange):
-            if order.client_order_id == event.order_id:
-                return True
-        return False
+        return True if event.order_id in self.maker_order_ids else False
+
+    def clean_maker_order_ids(self):
+        """
+        Cleans up old maker order IDs to avoid using expired ones
+        """
+        updated_maker_order_ids = {}
+        for order_id, timestamp in self.maker_order_ids.items():
+            if timestamp > self.current_timestamp - self.maker_order_ids_clean_interval:
+                updated_maker_order_ids[order_id] = timestamp
+
+        self.maker_order_ids = updated_maker_order_ids
+        self.maker_order_ids_clean_timestamp = self.current_timestamp + self.maker_order_ids_clean_interval
 
     def place_taker_order(self):
         amount_total = 0
@@ -249,7 +269,7 @@ class XEMMVik(ScriptStrategyBase):
             self.logger().info(
                 f"Add new taker_candidate_buffer self.taker_candidate_buffer={self.taker_candidate_buffer}")
             order_id = self.send_order_to_exchange(exchange=self.taker_exchange, candidate=taker_candidate_adjusted)
-            self.logger().info(f"send_order_to_exchange order_id = {order_id}")
+            self.logger().info(f"Taker send_order_to_exchange order_id = {order_id}")
             if order_id:
                 self.logger().info(f"Clear taker_candidate_buffer: {self.taker_candidate_buffer[-1]}")
                 self.taker_candidate_buffer.pop(-1)
@@ -261,6 +281,9 @@ class XEMMVik(ScriptStrategyBase):
             self.notify_hb_app_with_timestamp(msg)
 
     def send_order_to_exchange(self, exchange, candidate):
+        if self.dry_run:
+            return
+
         if candidate.order_side == TradeType.SELL:
             order_id = self.sell(exchange, candidate.trading_pair, candidate.amount, candidate.order_type, candidate.price)
         else:
