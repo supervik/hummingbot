@@ -228,6 +228,15 @@ class TriangularXEMM(ScriptStrategyBase):
                         self.log_with_clock(logging.INFO, f"Failed to place {candidate['order_candidate'].trading_pair}"
                                                           f" {candidate['order_candidate'].order_side} order. "
                                                           f"Trial number {candidate['trials']}")
+                        updated_price = self.connector.get_price_for_volume(candidate['order_candidate'].trading_pair,
+                                                                            candidate['order_candidate'].order_side,
+                                                                            candidate[
+                                                                                'order_candidate'].amount).result_price
+                        if candidate['order_candidate'].order_side == TradeType.BUY:
+                            candidate['order_candidate'].price = updated_price * Decimal(1 + self.slippage_buffer / 100)
+                        else:
+                            candidate['order_candidate'].price = updated_price * Decimal(1 - self.slippage_buffer / 100)
+
                         sent_result = self.adjust_and_place_order(candidate=candidate['order_candidate'],
                                                                   all_or_none=True)
                         if sent_result:
