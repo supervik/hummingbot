@@ -489,8 +489,8 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def did_fill_order(self, event: OrderFilledEvent):
         self.check_and_remove_taker_candidates(event, event.trade_type)
-        msg = (f"{event.trade_type.name} {round(event.amount, 10)} {event.trading_pair} {self.connector_name} "
-               f"at {round(event.price, 10)}")
+        msg = (f"{event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
+               f"at {round(event.price, 5)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
 
