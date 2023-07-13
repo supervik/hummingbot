@@ -13,20 +13,20 @@ class TriangularXEMM(ScriptStrategyBase):
     # Config params
     connector_name: str = "kucoin"
 
-    symbols_config = [{'asset': 'FTM', 'min_spread': Decimal('2.5'), 'amount': Decimal('0.01')},
-                      {'asset': 'XRP', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.01')}]
+    symbols_config = [{'asset': 'FTM', 'min_spread': Decimal('2.5'), 'amount': Decimal('0.02')},
+                      {'asset': 'XRP', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.005')}]
 
     maker_pairs = [f"{item['asset']}-ETH" for item in symbols_config]
     taker_pairs = [f"{item['asset']}-USDT" for item in symbols_config]
     cross_pair: str = f"ETH-USDT"
 
     min_spread_list = [item['min_spread'] for item in symbols_config]
-    # order_amount_in_quote = [Decimal("0.01")] * len(maker_pairs)
+    order_amount_in_quote_list = [item['amount'] for item in symbols_config]
     max_spread_distance = Decimal("0.5")
 
     # Define here all spreads and amounts the same
     # min_spread_list = [Decimal("0.25")] * len(maker_pairs)
-    order_amount_in_quote = Decimal("0.01")
+    # order_amount_in_quote = [Decimal("0.01")] * len(maker_pairs)
 
     set_target_from_config = False
     target_base_amount = Decimal("0")
@@ -43,7 +43,7 @@ class TriangularXEMM(ScriptStrategyBase):
     order_amount = 0
     taker_sell_price = 0
     taker_buy_price = 0
-    spread = {}
+    config = {}
     assets = {}
     arbitrage_round = {}
 
@@ -129,7 +129,11 @@ class TriangularXEMM(ScriptStrategyBase):
             min_spread = self.min_spread_list[i]
             max_spread = min_spread + self.max_spread_distance
             trade_spread = (min_spread + max_spread) / 2
-            self.spread[maker] = {"min_spread": min_spread, "max_spread": max_spread, "trade_spread": trade_spread}
+            order_amount = self.order_amount_in_quote_list[i]
+            self.config[maker] = {"min_spread": min_spread,
+                                  "max_spread": max_spread,
+                                  "trade_spread": trade_spread,
+                                  "order_amount_in_quote": order_amount}
 
     def set_target_amounts(self):
         self.notify_hb_app_with_timestamp(f"Setting target amounts from config")
@@ -281,7 +285,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def place_maker_orders(self):
         if not self.has_open_bid:
-            order_price = self.taker_sell_price * Decimal(1 - self.spread[self.maker_pair]["trade_spread"] / 100)
+            order_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["trade_spread"] / 100)
             buy_candidate = OrderCandidate(trading_pair=self.maker_pair,
                                            is_maker=True,
                                            order_type=OrderType.LIMIT,
@@ -309,7 +313,7 @@ class TriangularXEMM(ScriptStrategyBase):
             self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
 
     def calculate_order_amount(self):
-        self.order_amount = self.get_base_amount_for_quote_volume(self.maker_pair, True, self.order_amount_in_quote)
+        self.order_amount = self.get_base_amount_for_quote_volume(self.maker_pair, True, self.config[self.maker_pair]['order_amount_in_quote'])
 
     def calculate_taker_price(self, is_maker_bid):
         taker_side_1 = not is_maker_bid
@@ -332,8 +336,8 @@ class TriangularXEMM(ScriptStrategyBase):
             if order.trading_pair == self.maker_pair:
                 if order.is_buy:
                     self.has_open_bid = True
-                    upper_price = self.taker_sell_price * Decimal(1 - self.spread[self.maker_pair]["min_spread"] / 100)
-                    lower_price = self.taker_sell_price * Decimal(1 - self.spread[self.maker_pair]["max_spread"] / 100)
+                    upper_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["min_spread"] / 100)
+                    lower_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["max_spread"] / 100)
                     if order.price > upper_price or order.price < lower_price:
                         self.log_with_clock(logging.INFO, f"{order.trading_pair} BUY order price {order.price} is not "
                                                           f"in the range {lower_price} - {upper_price}. Cancel order.")
