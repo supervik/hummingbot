@@ -13,16 +13,20 @@ class TriangularXEMM(ScriptStrategyBase):
     # Config params
     connector_name: str = "kucoin"
 
-    maker_pairs = ['BONDLY-ETH', 'STND-ETH', 'VEGA-ETH', 'REQ-ETH', 'ETC-ETH', 'TRAC-ETH', 'ATOM-ETH',
-                   'FET-ETH', 'LYXE-ETH', 'TEL-ETH', 'XRP-ETH', 'LTC-ETH', 'EOS-ETH', 'XDC-ETH', 'STORE-ETH']
-    taker_pairs = ['BONDLY-USDT', 'STND-USDT', 'VEGA-USDT', 'REQ-USDT', 'ETC-USDT', 'TRAC-USDT', 'ATOM-USDT',
-                   'FET-USDT', 'LYXE-USDT', 'TEL-USDT', 'XRP-USDT', 'LTC-USDT', 'EOS-USDT', 'XDC-USDT', 'STORE-USDT']
-    cross_pair: str = "ETH-USDT"
+    symbols_config = [{'asset': 'FTM', 'min_spread': Decimal('2.5'), 'amount': Decimal('0.01')},
+                      {'asset': 'XRP', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.01')}]
 
-    min_spread_list = [Decimal("0.25")] * len(maker_pairs)
+    maker_pairs = [f"{item['asset']}-ETH" for item in symbols_config]
+    taker_pairs = [f"{item['asset']}-USDT" for item in symbols_config]
+    cross_pair: str = f"ETH-USDT"
+
+    min_spread_list = [item['min_spread'] for item in symbols_config]
+    # order_amount_in_quote = [Decimal("0.01")] * len(maker_pairs)
     max_spread_distance = Decimal("0.5")
 
-    order_amount_in_quote: Decimal = Decimal("0.002")
+    # Define here all spreads and amounts the same
+    # min_spread_list = [Decimal("0.25")] * len(maker_pairs)
+    order_amount_in_quote = Decimal("0.01")
 
     set_target_from_config = False
     target_base_amount = Decimal("0")
@@ -41,6 +45,7 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_buy_price = 0
     spread = {}
     assets = {}
+    arbitrage_round = {}
 
     has_open_bid = False
     has_open_ask = False
@@ -375,6 +380,8 @@ class TriangularXEMM(ScriptStrategyBase):
                f"at {round(event.price, 8)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
+        if event.trading_pair in self.maker_pairs:
+            self.arbitrage_round[event.trading_pair].append(event)
 
     def check_and_remove_taker_candidates(self, filled_event, trade_type):
         candidates = self.taker_candidates.copy()
