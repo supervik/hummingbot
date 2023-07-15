@@ -13,28 +13,43 @@ class TriangularXEMM(ScriptStrategyBase):
     # Config params
     connector_name: str = "kucoin"
 
-    symbols_config = [{'asset': 'FTM', 'min_spread': Decimal('2.5'), 'amount': Decimal('0.02')},
-                      {'asset': 'XRP', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.005')}]
+    symbols_config = [{'asset': 'ALGO', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.006')},
+                      {'asset': 'DAG', 'min_spread': Decimal('1.5'), 'amount': Decimal('0.006')},
+                      {'asset': 'KCS', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.006')},
+                      {'asset': 'XDC', 'min_spread': Decimal('1'), 'amount': Decimal('0.003')},
+                      {'asset': 'DFI', 'min_spread': Decimal('1'), 'amount': Decimal('0.003')},
+                      {'asset': 'FLUX', 'min_spread': Decimal('1'), 'amount': Decimal('0.003')},
+                      {'asset': 'CRPT', 'min_spread': Decimal('1'), 'amount': Decimal('0.0006')},
+                      {'asset': 'VEED', 'min_spread': Decimal('3'), 'amount': Decimal('0.0003')},
+                      {'asset': 'ETN', 'min_spread': Decimal('2'), 'amount': Decimal('0.0006')},
+                      {'asset': 'POND', 'min_spread': Decimal('1'), 'amount': Decimal('0.0006')},
+                      {'asset': 'ABBC', 'min_spread': Decimal('4'), 'amount': Decimal('0.0006')}
+                      ]
 
-    maker_pairs = [f"{item['asset']}-ETH" for item in symbols_config]
+    cross_pair = 'BTC-USDT'
+
+    maker_pairs = [f"{item['asset']}-BTC" for item in symbols_config]
     taker_pairs = [f"{item['asset']}-USDT" for item in symbols_config]
-    cross_pair: str = f"ETH-USDT"
-
     min_spread_list = [item['min_spread'] for item in symbols_config]
     order_amount_in_quote_list = [item['amount'] for item in symbols_config]
+
     max_spread_distance = Decimal("0.5")
-
-    # Define here all spreads and amounts the same
-    # min_spread_list = [Decimal("0.25")] * len(maker_pairs)
-    # order_amount_in_quote = [Decimal("0.01")] * len(maker_pairs)
-
     set_target_from_config = False
     target_base_amount = Decimal("0")
-    target_quote_amount = Decimal("0.1")
+    target_quote_amount = Decimal("0.03")
 
     order_delay = 30
-    slippage_buffer = Decimal("1")
+    slippage_buffer = Decimal("2")
+    # minimum order amount allowed for maker orders. Calculated from the order_amount minus this pct
+    order_amount_min_pct = Decimal("0.6")
     dry_run = False
+
+    # Define here all spreads and amounts the same and comment the lines above that calculate data from symbols_config
+    # maker_pairs = ['ADA-BTC', 'XRP-BTC']
+    # taker_pairs = ['ADA-USDT', 'XRP-USDT']
+    # cross_pair = 'BTC-USDT'
+    # min_spread_list = [Decimal("0.25")] * len(maker_pairs)
+    # order_amount_in_quote = [Decimal("0.01")] * len(maker_pairs)
 
     # Class params
     status: str = "NOT_INIT"
@@ -70,9 +85,11 @@ class TriangularXEMM(ScriptStrategyBase):
         # do some checks
         if self.status == "NOT_INIT":
             self.init_strategy()
-        elif self.status == "NOT_ACTIVE":
+
+        if self.status == "NOT_ACTIVE":
             return
-        elif self.status == "HEDGE_MODE":
+
+        if self.status == "HEDGE_MODE":
             self.process_hedge()
             return
 
@@ -83,6 +100,7 @@ class TriangularXEMM(ScriptStrategyBase):
             balance_diff_base_quantize = self.connector.quantize_order_amount(self.taker_pair, abs(balance_diff_base))
 
             if balance_diff_base_quantize != Decimal("0"):
+                self.log_with_clock(logging.INFO, "The maker balances doesn't match. Open hedge orders.")
                 balance_diff_quote = self.get_target_balance_diff(self.assets["maker_quote"], self.target_quote_amount)
                 if balance_diff_base > 0:
                     # bid was filled
@@ -91,7 +109,7 @@ class TriangularXEMM(ScriptStrategyBase):
                     # ask was filled
                     taker_orders = self.get_taker_order_data(False, abs(balance_diff_base), abs(balance_diff_quote))
                 self.place_taker_orders(taker_orders)
-                return
+                continue
 
             # open maker orders
             self.calculate_order_amount()
@@ -102,7 +120,7 @@ class TriangularXEMM(ScriptStrategyBase):
                 continue
 
             if self.current_timestamp < self.last_order_timestamp + self.order_delay:
-                return
+                continue
 
             self.place_maker_orders()
 
@@ -115,6 +133,7 @@ class TriangularXEMM(ScriptStrategyBase):
         self.set_spread()
         self.set_target_amounts()
         if not self.check_maker_taker_pairs():
+            self.notify_hb_app_with_timestamp(f"Check maker and taker failed. Set status NOT_ACTIVE")
             self.status = "NOT_ACTIVE"
 
     def set_base_quote_assets(self):
@@ -165,6 +184,7 @@ class TriangularXEMM(ScriptStrategyBase):
             if maker_base != taker_base:
                 self.log_with_clock(logging.INFO, f"!!! Base asset of {maker} dont match {taker}")
                 return False
+        return True
 
     def process_hedge(self):
         if len(self.taker_candidates) > 0:
@@ -285,7 +305,8 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def place_maker_orders(self):
         if not self.has_open_bid:
-            order_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["trade_spread"] / 100)
+            suggested_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["trade_spread"] / 100)
+            order_price = self.get_closest_ob_bid_price(self.maker_pair, True, suggested_price)
             buy_candidate = OrderCandidate(trading_pair=self.maker_pair,
                                            is_maker=True,
                                            order_type=OrderType.LIMIT,
@@ -293,6 +314,8 @@ class TriangularXEMM(ScriptStrategyBase):
                                            amount=self.order_amount,
                                            price=order_price)
             buy_candidate_adjusted = self.connector.budget_checker.adjust_candidate(buy_candidate, all_or_none=False)
+            if buy_candidate_adjusted.amount < self.order_amount * self.order_amount_min_pct:
+                self.log_with_clock(logging.INFO, f"Not enough funds to open maker order on {self.maker_pair}")
             if buy_candidate_adjusted.amount != Decimal("0"):
                 self.send_order_to_exchange(buy_candidate_adjusted)
                 self.log_with_clock(logging.INFO, f"Placed maker BUY order {self.maker_pair}")
@@ -370,6 +393,30 @@ class TriangularXEMM(ScriptStrategyBase):
 
         return Decimal(cumulative_base_amount)
 
+    def get_closest_ob_bid_price(self, pair, is_bid, price) -> Decimal:
+        """
+        Calculates the next tick best price in the orderbook
+        """
+        orderbook = self.connector.get_order_book(pair)
+        orderbook_entries = orderbook.bid_entries() if is_bid else orderbook.ask_entries()
+
+        next_price = price
+        for order_book_row in orderbook_entries:
+            row_price = order_book_row.price
+            if row_price > price:
+                continue
+
+            if row_price == price:
+                next_price = Decimal(row_price)
+                break
+
+            if row_price < price:
+                increment = self.connector.get_order_price_quantum(pair, Decimal("1"))
+                next_price = Decimal(row_price) + increment
+                break
+
+        return next_price
+
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         self.log_with_clock(logging.INFO, f"Buy order is created on the market {event.trading_pair}")
         self.check_and_remove_taker_candidates(event, TradeType.BUY)
@@ -384,8 +431,8 @@ class TriangularXEMM(ScriptStrategyBase):
                f"at {round(event.price, 8)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
-        if event.trading_pair in self.maker_pairs:
-            self.arbitrage_round[event.trading_pair].append(event)
+        # if event.trading_pair in self.maker_pairs:
+        #     self.arbitrage_round[event.trading_pair].append(event)
 
     def check_and_remove_taker_candidates(self, filled_event, trade_type):
         candidates = self.taker_candidates.copy()
