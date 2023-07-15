@@ -29,11 +29,6 @@ class TriangularXEMM(ScriptStrategyBase):
 
     cross_pair = 'BTC-USDT'
 
-    maker_pairs = [f"{item['asset']}-BTC" for item in symbols_config]
-    taker_pairs = [f"{item['asset']}-USDT" for item in symbols_config]
-    min_spread_list = [item['min_spread'] for item in symbols_config]
-    order_amount_in_quote_list = [item['amount'] for item in symbols_config]
-
     spread_distance = Decimal("0.25")
     max_order_age = 120
     set_target_from_config = False
@@ -45,7 +40,12 @@ class TriangularXEMM(ScriptStrategyBase):
     # minimum order amount allowed for maker orders. Calculated from the order_amount minus this pct
     order_amount_min_pct = Decimal("0.6")
     dry_run = False
+    taker_order_type = OrderType.MARKET
 
+    maker_pairs = [f"{item['asset']}-BTC" for item in symbols_config]
+    taker_pairs = [f"{item['asset']}-USDT" for item in symbols_config]
+    min_spread_list = [item['min_spread'] for item in symbols_config]
+    order_amount_in_quote_list = [item['amount'] for item in symbols_config]
     # Define here all spreads and amounts the same and comment the lines above that calculate data from symbols_config
     # maker_pairs = ['ADA-BTC', 'XRP-BTC']
     # taker_pairs = ['ADA-USDT', 'XRP-USDT']
@@ -292,7 +292,7 @@ class TriangularXEMM(ScriptStrategyBase):
             taker_candidate = OrderCandidate(
                 trading_pair=taker_order["pair"][i],
                 is_maker=False,
-                order_type=OrderType.LIMIT,
+                order_type=self.taker_order_type,
                 order_side=side,
                 amount=amount,
                 price=price)
