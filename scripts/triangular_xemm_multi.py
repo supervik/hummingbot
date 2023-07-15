@@ -1,4 +1,5 @@
 import logging
+from math import ceil
 
 import pandas as pd
 
@@ -14,7 +15,7 @@ class TriangularXEMM(ScriptStrategyBase):
     connector_name: str = "kucoin"
 
     symbols_config = [{'asset': 'ALGO', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.006')},
-                      {'asset': 'DAG', 'min_spread': Decimal('1.5'), 'amount': Decimal('0.006')},
+                      {'asset': 'DAG', 'min_spread': Decimal('2.5'), 'amount': Decimal('0.006')},
                       {'asset': 'KCS', 'min_spread': Decimal('0.5'), 'amount': Decimal('0.006')},
                       {'asset': 'XDC', 'min_spread': Decimal('1'), 'amount': Decimal('0.003')},
                       {'asset': 'DFI', 'min_spread': Decimal('1'), 'amount': Decimal('0.003')},
@@ -33,7 +34,8 @@ class TriangularXEMM(ScriptStrategyBase):
     min_spread_list = [item['min_spread'] for item in symbols_config]
     order_amount_in_quote_list = [item['amount'] for item in symbols_config]
 
-    max_spread_distance = Decimal("0.5")
+    spread_distance = Decimal("0.25")
+    max_order_age = 120
     set_target_from_config = False
     target_base_amount = Decimal("0")
     target_quote_amount = Decimal("0.03")
@@ -146,11 +148,9 @@ class TriangularXEMM(ScriptStrategyBase):
     def set_spread(self):
         for i, maker in enumerate(self.maker_pairs):
             min_spread = self.min_spread_list[i]
-            max_spread = min_spread + self.max_spread_distance
-            trade_spread = (min_spread + max_spread) / 2
+            trade_spread = min_spread + self.spread_distance
             order_amount = self.order_amount_in_quote_list[i]
             self.config[maker] = {"min_spread": min_spread,
-                                  "max_spread": max_spread,
                                   "trade_spread": trade_spread,
                                   "order_amount_in_quote": order_amount}
 
@@ -359,11 +359,15 @@ class TriangularXEMM(ScriptStrategyBase):
             if order.trading_pair == self.maker_pair:
                 if order.is_buy:
                     self.has_open_bid = True
-                    upper_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["min_spread"] / 100)
-                    lower_price = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["max_spread"] / 100)
-                    if order.price > upper_price or order.price < lower_price:
-                        self.log_with_clock(logging.INFO, f"{order.trading_pair} BUY order price {order.price} is not "
-                                                          f"in the range {lower_price} - {upper_price}. Cancel order.")
+                    buy_cancel_threshold = self.taker_sell_price * Decimal(1 - self.config[self.maker_pair]["min_spread"] / 100)
+                    if order.price > buy_cancel_threshold:
+                        self.log_with_clock(logging.INFO, f"{order.trading_pair} BUY order price {order.price} "
+                                                          f"is higher than {buy_cancel_threshold}. Cancel order.")
+                        self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
+                        return True
+                    cancel_timestamp = order.creation_timestamp / 1000000 + self.max_order_age
+                    if cancel_timestamp < self.current_timestamp:
+                        self.log_with_clock(logging.INFO, f"{order.trading_pair} order age exceeds max. Cancel order.")
                         self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
                         return True
         return False
@@ -402,17 +406,15 @@ class TriangularXEMM(ScriptStrategyBase):
 
         next_price = price
         for order_book_row in orderbook_entries:
-            row_price = order_book_row.price
+            row_price = Decimal(order_book_row.price)
             if row_price > price:
                 continue
 
-            if row_price == price:
-                next_price = Decimal(row_price)
-                break
-
             if row_price < price:
-                increment = self.connector.get_order_price_quantum(pair, Decimal("1"))
-                next_price = Decimal(row_price) + increment
+                price_quantum = self.connector.get_order_price_quantum(pair, Decimal("1"))
+                next_price = (ceil(row_price / price_quantum) + 1) * price_quantum
+                if next_price > price:
+                    next_price = price
                 break
 
         return next_price
