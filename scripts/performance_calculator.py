@@ -20,12 +20,12 @@ class PerformanceCalculator(ScriptStrategyBase):
     ignore_asset = "KCS"
 
     # group by base asset and id (for multi pairs) or id only (trade round for simple/tri xemm)
-    group_by_base_asset = True
+    group_by_base_asset = False
     group_by_day = False
 
     # time in seconds between trades to combine them into 1 round
     timestamp_threshold = 10
-    fee_pct = 0.12
+    fee_pct = 0.08
 
     markets = {connector_name: {fake_pair}}
 
@@ -59,11 +59,15 @@ class PerformanceCalculator(ScriptStrategyBase):
                 df = df.groupby(['base_asset', 'id'], as_index=False).sum()
                 columns = ["id", "base_asset"] + list(all_assets)
             else:
-                df = df.groupby('id', as_index=False).sum()
+                numeric_cols = df.select_dtypes(include=['float']).columns
+                self.log_with_clock(logging.INFO, f"numeric_cols = {numeric_cols}")
+                df = df.groupby('id', as_index=False).agg({**{col: 'sum' for col in numeric_cols}, **{'symbol': 'first'}})
+                # df = df.groupby('id', as_index=False).sum()
                 df['time'] = pd.to_datetime(df['id'], unit='ms')
                 df['time'] = df['time'].dt.floor('S')
-                columns = ["id", "time"] + list(all_assets)
+                columns = ["id", "time", "symbol"] + list(all_assets)
 
+            self.log_with_clock(logging.INFO, f"df = {df}")
             self.log_with_clock(logging.INFO, f"columns = {columns}")
             df = df[columns]
 

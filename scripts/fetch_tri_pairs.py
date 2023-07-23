@@ -207,7 +207,7 @@ class FetchTriPairs(ScriptStrategyBase):
             safe_ensure_future(self.call_fetch_pairs())
             # all_pairs = safe_ensure_future(self.call_fetch_pairs())
             self.log_with_clock(logging.INFO, f"all_pairs {self.pairs}")
-            # self.strategy_init()
+            self.strategy_init()
             self.status = "READY"
         # self.log_with_clock(logging.INFO, "New tick")
 

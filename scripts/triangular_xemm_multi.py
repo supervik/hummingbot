@@ -41,6 +41,7 @@ class TriangularXEMM(ScriptStrategyBase):
     order_amount_min_pct = Decimal("0.6")
     dry_run = False
     taker_order_type = OrderType.MARKET
+    rebalance_at_start = False
 
     maker_pairs = [f"{item['asset']}-BTC" for item in symbols_config]
     taker_pairs = [f"{item['asset']}-USDT" for item in symbols_config]
@@ -51,7 +52,7 @@ class TriangularXEMM(ScriptStrategyBase):
     # taker_pairs = ['ADA-USDT', 'XRP-USDT']
     # cross_pair = 'BTC-USDT'
     # min_spread_list = [Decimal("0.25")] * len(maker_pairs)
-    # order_amount_in_quote = [Decimal("0.01")] * len(maker_pairs)
+    # order_amount_in_quote_list = [Decimal("0.01")] * len(maker_pairs)
 
     # Class params
     status: str = "NOT_INIT"
@@ -133,7 +134,8 @@ class TriangularXEMM(ScriptStrategyBase):
         self.notify_hb_app_with_timestamp("Strategy started")
         self.status = "ACTIVE"
         self.set_spread()
-        self.set_target_amounts()
+        if not self.set_target_amounts():
+            self.status = "NOT_ACTIVE"
         if not self.check_maker_taker_pairs():
             self.notify_hb_app_with_timestamp(f"Check maker and taker failed. Set status NOT_ACTIVE")
             self.status = "NOT_ACTIVE"
@@ -161,13 +163,18 @@ class TriangularXEMM(ScriptStrategyBase):
             balance_diff_base = self.get_target_balance_diff(self.assets["maker_base"], self.target_base_amount)
             balance_diff_base_quantize = self.connector.quantize_order_amount(self.taker_pair, abs(balance_diff_base))
             if balance_diff_base_quantize != Decimal("0"):
-                self.notify_hb_app_with_timestamp(f"Target balances of {self.maker_pair} doesn't match. "
-                                                  f"Rebalance in {self.order_delay} sec")
-                self.last_order_timestamp = self.current_timestamp
+                self.notify_hb_app_with_timestamp(f"Target balances of {self.maker_pair} doesn't match.")
+                if self.rebalance_at_start:
+                    self.notify_hb_app_with_timestamp(f"Starting rebalance")
+                    self.last_order_timestamp = self.current_timestamp
+                else:
+                    self.notify_hb_app_with_timestamp(f"status NOT_ACTIVE. Activate rebalance_at_start for rebalance")
+                    return False
         msg = f"Target base amount: {self.target_base_amount} base asset, " \
               f"Target quote amount: {self.target_quote_amount} {self.assets['maker_quote']}"
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
+        return True
 
     def check_maker_taker_pairs(self):
         if len(self.maker_pairs) != len(self.taker_pairs):

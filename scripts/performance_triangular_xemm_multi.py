@@ -2,7 +2,7 @@ import pandas as pd
 
 # Load the CSV file into a pandas DataFrame
 directory = 'trades'
-filename = 'trades_triangular_xemm_multi_ETH_USDT_ku.csv'
+filename = 'trades_triangular_xemm_multi_test_ETH_USDT_spread_diffe.csv'
 # df = pd.read_csv('trades_triangular_xemm_mul.csv')
 df = pd.read_csv(f'{directory}/{filename}')
 
@@ -82,3 +82,6 @@ df_performance['performance'] = df_performance['performance'] - 0.24
 
 # Save the DataFrame to an Excel file
 df_performance.to_excel(f'{directory}/performance_{filename}.xlsx', index=False)
+
+# Print dataframe
+print(df_performance)
