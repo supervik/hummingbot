@@ -1,8 +1,12 @@
 import pandas as pd
 
+# The script that calculates the performance of the triangular arbitrage/xemm.
+# It can process both one triangle and multiple triangles
+# Written mostly with the help of chatGPT
+
 # Load the CSV file into a pandas DataFrame
 directory = 'trades'
-filename = 'trades_triangular_xemm_multi_test_ETH_USDT_spread_diffe.csv'
+filename = 'trades_triangular_xemm_multi_kucoin_BTC_USDT_spread_diff.csv'
 # df = pd.read_csv('trades_triangular_xemm_mul.csv')
 df = pd.read_csv(f'{directory}/{filename}')
 

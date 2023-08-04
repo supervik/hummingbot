@@ -11,6 +11,9 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 
 class TriangularXEMM(ScriptStrategyBase):
+    """
+    The triangular XEMM on multiple pairs
+    """
     # Config params
     connector_name: str = "kucoin"
 

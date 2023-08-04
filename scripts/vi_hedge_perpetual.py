@@ -10,6 +10,16 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 
 class HedgePerpetual(ScriptStrategyBase):
+    """
+    This script buys and sells the same amount on spot and perpetual for hedging purposes.
+    For example you need an asset to trade on spot market but you don't want to hold it.
+    The script will buy this asset and open short position on futures
+    To buy the script places limit orders in the orderbook and waits for it to be filled.
+    The spread is defined in spread_bps. The min_spread at which the order is canceled is min_spread_bps
+    The script will do multiple iterations with max_order_amount until buys total_amount reached
+
+    The script also works in the opposite direction to close the position and sell the asset on spot market
+    """
     # Config params
     maker_connector_name: str = "gate_io"
     taker_connector_name: str = "gate_io_perpetual"
@@ -59,8 +69,6 @@ class HedgePerpetual(ScriptStrategyBase):
         return self.connectors[self.taker_connector_name]
 
     def on_tick(self):
-        """
-        """
         if self.status == "NOT_INIT":
             self.init_strategy()
         if self.status == "NOT_ACTIVE":

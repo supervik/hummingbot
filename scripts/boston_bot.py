@@ -45,16 +45,17 @@ class BostonBot(ScriptStrategyBase):
 
     size_long_usdt = Decimal("15")
     size_short_usdt = Decimal("12")
-    trailing_long_percentage = Decimal("0.001")
-    trailing_short_percentage = Decimal("0.1")
-    check_trailing_sec = 60
+    trailing_long_percentage = Decimal("1.5")
+    trailing_short_percentage = Decimal("1.5")
+    check_trailing_sec = 300
 
-    stop_loss_long_percentage = Decimal("0.19")
+    stop_loss_long_percentage = Decimal("0.5")
     stop_loss_short_percentage = Decimal("0.5")
     leverage = 10
     # use_time_frame = True
-    check_stop_loss_sec = 60
+    check_stop_loss_sec = 300
     timeout_sec = 60
+    rounding_digits = 2
 
     # class parameters
     status = BotStatus.NOT_INIT
@@ -63,7 +64,6 @@ class BostonBot(ScriptStrategyBase):
     trailing_price_update_timestamp = 0
     stop_loss_update_timestamp = 0
     next_cycle_timestamp = 0
-    rounding_digits = 2
     previous_price = Decimal("0")
     current_price = Decimal("0")
     check_num = 0

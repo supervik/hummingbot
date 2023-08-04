@@ -1,6 +1,70 @@
 import requests
 import pandas as pd
 
+# Config parameters. Quote assets and volume threshold denominated in quote
+exchange = "gate_io"
+quote_1 = "BTC"
+quote_2 = "USDT"
+quote_1_vol_thrsh = 0.5
+quote_2_vol_thrsh = 10000
+
+
+def main(exchange, quote_1, quote_2, quote_1_vol_thrsh, quote_2_vol_thrsh):
+    """
+    This scripts finds triangle pairs of the same exchange filtered with defined volumes
+    """
+    # get all pairs. Define exchange here
+    all_pairs_volume = get_exchange_function(exchange)
+    if not all_pairs_volume:
+        return
+    all_pairs = [pair for pair in all_pairs_volume]
+    pairs_by_quote = divide_pairs_by_quote_asset(all_pairs)
+
+    print("\n Base assets sorted by the quote asset")
+    for quote_asset, base_assets in pairs_by_quote.items():
+        print(quote_asset, len(base_assets), base_assets)
+
+    filtered_quote_1 = [base for base in pairs_by_quote[quote_1] if float(all_pairs_volume[f"{base}-{quote_1}"]) >= quote_1_vol_thrsh]
+    filtered_quote_2 = [base for base in pairs_by_quote[quote_2] if float(all_pairs_volume[f"{base}-{quote_2}"]) >= quote_2_vol_thrsh]
+
+    triangle_bases = set(filtered_quote_1) & set(filtered_quote_2)
+    triangle_bases_list = sorted(list(triangle_bases))
+
+    maker_pairs = [f"{base}-{quote_1}" for base in triangle_bases_list]
+    taker_pairs = [f"{base}-{quote_2}" for base in triangle_bases_list]
+
+    # maker_pairs_with_volume_thrsh = [pair for pair in maker_pairs if float(all_pairs_volume[pair]) >= quote_1_vol_thrsh]
+    # taker_pairs_with_volume_thrsh = [pair for pair in maker_pairs if float(all_pairs_volume[pair]) >= quote_1_vol_thrsh]
+    print(f"\n Base assets for {quote_1} filtered with volume {quote_1_vol_thrsh}")
+    print(len(filtered_quote_1), filtered_quote_1)
+
+    print(f"Base assets for {quote_2} filtered with volume {quote_2_vol_thrsh}")
+    print(len(filtered_quote_2), filtered_quote_2)
+
+    print("\n Triangle pairs for maker")
+    print(maker_pairs)
+
+    print(" Triangle pairs for taker")
+    print(taker_pairs)
+    print(f"\n Total number of triangles: \n{len(triangle_bases_list)}")
+    # print(all_pairs_volume)
+
+    # Save to Excel
+    # df = pd.DataFrame(all_pairs, columns=['Pairs'])
+    # df.to_csv('common_pairs.csv', index=False)
+
+
+def get_exchange_function(exchange_name):
+    if exchange_name == "kucoin":
+        return get_kucoin_volume()
+    elif exchange_name == "gate_io":
+        return get_gate_io_volume()
+    elif exchange_name == "binance":
+        return get_binance_volume()
+    else:
+        print("The exchange not found!")
+        return None
+
 
 # Methods to get all traded pairs from different exchanges
 def get_kucoin_pairs():
@@ -111,43 +175,4 @@ def divide_pairs_by_quote_asset(pairs):
     return quotes
 
 
-# Config parameters. Quote assets and volume threshold denominated in quote
-quote_1 = "USDT"
-quote_2 = "ETH"
-quote_1_vol_thrsh = 10000
-quote_2_vol_thrsh = 5
-
-# get all pairs
-all_pairs_volume = get_binance_volume()
-all_pairs = [pair for pair in all_pairs_volume]
-#
-# print(f"len1 = {len(all_pairs)}")
-# print(f"{[pair for pair in all_pairs_volume]}")
-pairs_by_quote = divide_pairs_by_quote_asset(all_pairs)
-
-for quote_asset, base_assets in pairs_by_quote.items():
-    print(quote_asset, len(base_assets), base_assets)
-
-filtered_quote_1 = [base for base in pairs_by_quote[quote_1] if float(all_pairs_volume[f"{base}-{quote_1}"]) >= quote_1_vol_thrsh]
-filtered_quote_2 = [base for base in pairs_by_quote[quote_2] if float(all_pairs_volume[f"{base}-{quote_2}"]) >= quote_2_vol_thrsh]
-
-triangle_bases = set(filtered_quote_1) & set(filtered_quote_2)
-triangle_bases_list = sorted(list(triangle_bases))
-
-maker_pairs = [f"{base}-{quote_1}" for base in triangle_bases_list]
-taker_pairs = [f"{base}-{quote_2}" for base in triangle_bases_list]
-
-# maker_pairs_with_volume_thrsh = [pair for pair in maker_pairs if float(all_pairs_volume[pair]) >= quote_1_vol_thrsh]
-# taker_pairs_with_volume_thrsh = [pair for pair in maker_pairs if float(all_pairs_volume[pair]) >= quote_1_vol_thrsh]
-print(len(filtered_quote_1), filtered_quote_1)
-print(len(filtered_quote_2), filtered_quote_2)
-
-print(maker_pairs)
-print(taker_pairs)
-print(len(triangle_bases_list))
-# print(all_pairs_volume)
-
-
-# Save to Excel
-# df = pd.DataFrame(all_pairs, columns=['Pairs'])
-# df.to_csv('common_pairs.csv', index=False)
+main(exchange, quote_1, quote_2, quote_1_vol_thrsh, quote_2_vol_thrsh)

@@ -10,6 +10,11 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 
 class TriangularXEMM(ScriptStrategyBase):
+    """
+    The script that performs triangular XEMM on a single exchange.
+    The script based on balances check. If it finds the imbalance it opens 2 other orders
+    The script has kill_switch and fee asset check and rebalance
+    """
     # Config params
     connector_name: str = "kucoin"
     maker_pair: str = "USDT-DAI"

@@ -14,7 +14,8 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 class XEMMVik(ScriptStrategyBase):
     """
-    Multi-pair strategy. It only opens maker orders but considers the taker prices as well.
+    Multi-pair strategy for testing purposes
+    It only opens maker orders but considers the taker prices as well.
     The objective is to identify pairs that are suitable for the XEMM strategy on two exchanges.
     The pair is considered more suitable for XEMM if it has more orders opened on both sides (first buy and then sell)
     """

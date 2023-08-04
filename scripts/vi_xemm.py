@@ -14,6 +14,8 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 class XEMMVik(ScriptStrategyBase):
     """
+    XEMM by vik
+    TODO: check and make it more reliable
     """
     maker_exchange = "kucoin"
     maker_pair = "IGU-USDT"

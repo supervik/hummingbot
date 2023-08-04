@@ -12,6 +12,7 @@ from hummingbot.client.hummingbot_application import HummingbotApplication
 
 class PerformanceCalculator(ScriptStrategyBase):
     """
+    Old Performance calculator script. Leave it only for ed purpose
     """
     # Config params
     connector_name: str = "kucoin_paper_trade"

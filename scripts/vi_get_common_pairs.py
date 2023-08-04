@@ -2,6 +2,11 @@ import requests
 import pandas as pd
 
 
+"""
+This script gets all trading pairs from different exchanges both spot and futures and then finds the common ones
+"""
+
+
 # Methods to get all traded pairs from different exchanges
 def get_kucoin_pairs():
     url = "https://api.kucoin.com/api/v2/symbols"
