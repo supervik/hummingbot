@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -10,7 +11,7 @@ from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, PositionSide, PriceType, PositionMode, TradeType, PositionAction
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
 from hummingbot.core.event.events import BuyOrderCreatedEvent, SellOrderCreatedEvent, OrderFilledEvent, \
-    OrderCancelledEvent
+    OrderCancelledEvent, MarketOrderFailureEvent
 from hummingbot.smart_components.position_executor.data_types import TrackedOrder
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
@@ -37,7 +38,7 @@ def next_timeframe(current_timestamp, interval) -> int:
 
 class BostonBot(ScriptStrategyBase):
     """
-    - The bot places long and short orders below or under the last market price
+    - The bot places long and short orders below or above the last market price
       - If reverse_mode set to False bot places long +% and Short -% of the current price
       - If reverse_mode set to True bot places long -% and Short +% of the current price
     - The bot updates the order prices every check_trailing_sec seconds timeframe
@@ -49,20 +50,23 @@ class BostonBot(ScriptStrategyBase):
     # config parameters
     exchange: str = "binance_perpetual"
     trading_pair: str = "ETH-USDT"
-    reverse_mode = True
+    reverse_mode = False
 
     size_long_usdt = Decimal("15")
     size_short_usdt = Decimal("12")
-    trailing_long_percentage = Decimal("0.001")
-    trailing_short_percentage = Decimal("0.01")
-    check_trailing_sec = 60
+    trailing_long_percentage = Decimal("1.5")
+    trailing_short_percentage = Decimal("1.5")
+    check_trailing_sec = 300
 
     stop_loss_long_percentage = Decimal("0.5")
     stop_loss_short_percentage = Decimal("0.5")
-    check_stop_loss_sec = 120
+    check_stop_loss_sec = 300
     leverage = 10
     timeout_sec = 60
     rounding_digits = 2
+
+    failed_long_short_trials_limit = 10
+    failed_stop_loss_trials_limit = 20
 
     # class parameters
     status = BotStatus.NOT_INIT
@@ -80,16 +84,13 @@ class BostonBot(ScriptStrategyBase):
     log_finalize_position_printed = False
     account_positions = None
     filled_position_side = None
-    long_placed = False
-    short_placed = False
-    sl_placed = False
-    long_level_order_id = None
-    short_level_order_id = None
-    stop_loss_order_id = None
-    close_order_id = None
+    long_order = {}
+    short_order = {}
+    stop_loss_order = {}
+    closing_order = {}
     stop_loss_order_price = Decimal("0")
-    open_order: TrackedOrder = TrackedOrder()
-    close_order: TrackedOrder = TrackedOrder()
+    tracked_open_order: TrackedOrder = TrackedOrder()
+    tracked_close_order: TrackedOrder = TrackedOrder()
     server_time = 0
     long_sign = ""
     short_sign = ""
@@ -133,7 +134,7 @@ class BostonBot(ScriptStrategyBase):
                 self.cancel_all_orders()
                 self.log_trailing_price_printed = True
             if self.server_time > self.trailing_price_update_timestamp:
-                if self.long_placed or self.short_placed:
+                if self.long_order["placed"] or self.short_order["placed"]:
                     self.logger().info("OrderCancelledEvent for long or short order hasn't arrived yet")
                     self.cancel_all_orders()
                     return
@@ -147,7 +148,8 @@ class BostonBot(ScriptStrategyBase):
                 self.log_filled_order()
                 self.log_filled_order_printed = True
                 return
-            open_positions = [position for position in self.account_positions.values() if position.trading_pair == self.trading_pair]
+            open_positions = [position for position in self.account_positions.values() if
+                              position.trading_pair == self.trading_pair]
             if not len(open_positions):
                 self.logger().info("No open positions found")
                 self.cancel_all_orders()
@@ -156,8 +158,8 @@ class BostonBot(ScriptStrategyBase):
                     self.cancel_all_orders()
                     self.log_stop_loss_printed = True
                 if self.server_time > self.stop_loss_update_timestamp:
-                    if self.sl_placed:
-                        self.logger().info("OrderCancelledEvent for SL hasn't arrived yet")
+                    if self.stop_loss_order["placed"]:
+                        self.logger().info("OrderCancelledEvent for stop loss order hasn't arrived yet")
                         self.cancel_all_orders()
                         return
                     self.stop_loss_update_timestamp = next_timeframe(self.server_time + 1, self.check_stop_loss_sec)
@@ -180,10 +182,21 @@ class BostonBot(ScriptStrategyBase):
 
         base, quote = split_hb_trading_pair(self.trading_pair)
         balance = round(self.connector.get_balance(quote), self.rounding_digits)
-        mode = "REVERSE MODE |" if self.reverse_mode else ""
+        mode = " REVERSE MODE |" if self.reverse_mode else ""
         self.long_sign = "-" if self.reverse_mode else "+"
         self.short_sign = "+" if self.reverse_mode else "-"
-        self.notify_app_and_log(f"Start of Boston bot | {mode} Available balance: {balance} {quote} | Check trailing {trailing_price_update_str} ")
+
+        self.long_order["placed"] = False
+        self.short_order["placed"] = False
+        self.stop_loss_order["placed"] = False
+        self.closing_order["placed"] = False
+        self.long_order["failed_counter"] = 0
+        self.short_order["failed_counter"] = 0
+        self.stop_loss_order["failed_counter"] = 0
+        self.closing_order["failed_counter"] = 0
+
+        self.notify_app_and_log(
+            f"Start of Boston bot |{mode} Available balance: {balance} {quote} | Check trailing {trailing_price_update_str} ")
         self.status = BotStatus.ACTIVE_PRICE_LEVELS
         return
 
@@ -225,11 +238,12 @@ class BostonBot(ScriptStrategyBase):
                                                   order_type=order_type,
                                                   order_side=TradeType.SELL, amount=amount_short,
                                                   price=self.trailing_price_short, leverage=Decimal(self.leverage))
-        candidate_long_adjusted = self.connector.budget_checker.adjust_candidate(candidate_long, all_or_none=True)
-        candidate_short_adjusted = self.connector.budget_checker.adjust_candidate(candidate_short, all_or_none=True)
+        self.long_order["candidate"] = self.connector.budget_checker.adjust_candidate(candidate_long, all_or_none=True)
+        self.short_order["candidate"] = self.connector.budget_checker.adjust_candidate(candidate_short,
+                                                                                       all_or_none=True)
 
-        self.long_level_order_id = self.send_order_to_exchange(candidate_long_adjusted, PositionAction.OPEN)
-        self.short_level_order_id = self.send_order_to_exchange(candidate_short_adjusted, PositionAction.OPEN)
+        self.long_order["order_id"] = self.send_order_to_exchange(self.long_order["candidate"], PositionAction.OPEN)
+        self.short_order["order_id"] = self.send_order_to_exchange(self.short_order["candidate"], PositionAction.OPEN)
 
     def log_stop_loss(self):
         current_price = round(self.connector.get_price_by_type(self.trading_pair, PriceType.LastTrade),
@@ -239,8 +253,10 @@ class BostonBot(ScriptStrategyBase):
                                 f"Check no {self.check_num}: {stop_loss_update_str}")
 
     def update_stop_loss_orders(self):
-        self.current_price = round(self.connector.get_price_by_type(self.trading_pair, PriceType.LastTrade), self.rounding_digits)
-        self.logger().info(f"Check prices. Previous price = {self.previous_price}. Current price = {self.current_price}")
+        self.current_price = round(self.connector.get_price_by_type(self.trading_pair, PriceType.LastTrade),
+                                   self.rounding_digits)
+        self.logger().info(
+            f"Check prices. Previous price = {self.previous_price}. Current price = {self.current_price}")
 
         if self.filled_position_side == TradeType.BUY:
             if self.previous_price <= self.current_price or self.check_num == 0:
@@ -248,60 +264,68 @@ class BostonBot(ScriptStrategyBase):
                 self.stop_loss_order_price = self.current_price * (1 - self.stop_loss_long_percentage / Decimal("100"))
                 self.logger().info(f"sl_price_updated = {self.stop_loss_order_price}")
 
-                candidate_short = PerpetualOrderCandidate(trading_pair=self.trading_pair,
-                                                          is_maker=True,
-                                                          order_type=OrderType.STOP_MARKET,
-                                                          order_side=TradeType.SELL,
-                                                          amount=Decimal("0"),
-                                                          price=self.stop_loss_order_price,
-                                                          leverage=Decimal(self.leverage))
-                self.stop_loss_order_id = self.send_order_to_exchange(candidate_short, PositionAction.CLOSE)
+                self.stop_loss_order["candidate"] = PerpetualOrderCandidate(trading_pair=self.trading_pair,
+                                                                            is_maker=True,
+                                                                            order_type=OrderType.STOP_MARKET,
+                                                                            order_side=TradeType.SELL,
+                                                                            amount=Decimal("0"),
+                                                                            price=self.stop_loss_order_price,
+                                                                            leverage=Decimal(self.leverage))
+                self.stop_loss_order["order_id"] = self.send_order_to_exchange(self.stop_loss_order["candidate"],
+                                                                               PositionAction.CLOSE)
             else:
                 self.logger().info("Price changed. Close long position")
-                candidate_short = PerpetualOrderCandidate(trading_pair=self.trading_pair,
-                                                          is_maker=False,
-                                                          order_type=OrderType.MARKET,
-                                                          order_side=TradeType.SELL,
-                                                          amount=self.open_order.executed_amount_base,
-                                                          price=Decimal("NaN"),
-                                                          leverage=Decimal(self.leverage))
-                self.close_order_id = self.send_order_to_exchange(candidate_short, PositionAction.CLOSE)
+                self.closing_order["candidate"] = PerpetualOrderCandidate(trading_pair=self.trading_pair,
+                                                                          is_maker=False,
+                                                                          order_type=OrderType.MARKET,
+                                                                          order_side=TradeType.SELL,
+                                                                          amount=self.tracked_open_order.executed_amount_base,
+                                                                          price=Decimal("NaN"),
+                                                                          leverage=Decimal(self.leverage))
+                self.closing_order["order_id"] = self.send_order_to_exchange(self.closing_order["candidate"],
+                                                                             PositionAction.CLOSE)
         else:
             if self.previous_price >= self.current_price or self.check_num == 0:
                 self.logger().info("Update stop loss price for short position")
                 self.stop_loss_order_price = self.current_price * (1 + self.stop_loss_short_percentage / Decimal("100"))
                 self.logger().info(f"sl_price_updated = {self.stop_loss_order_price}")
 
-                candidate_long = PerpetualOrderCandidate(trading_pair=self.trading_pair, is_maker=True,
-                                                         order_type=OrderType.STOP_MARKET,
-                                                         order_side=TradeType.BUY, amount=Decimal("0"),
-                                                         price=self.stop_loss_order_price,
-                                                         leverage=Decimal(self.leverage))
-                self.stop_loss_order_id = self.send_order_to_exchange(candidate_long, PositionAction.CLOSE)
+                self.stop_loss_order["candidate"] = PerpetualOrderCandidate(trading_pair=self.trading_pair,
+                                                                            is_maker=True,
+                                                                            order_type=OrderType.STOP_MARKET,
+                                                                            order_side=TradeType.BUY,
+                                                                            amount=Decimal("0"),
+                                                                            price=self.stop_loss_order_price,
+                                                                            leverage=Decimal(self.leverage))
+                self.stop_loss_order["order_id"] = self.send_order_to_exchange(self.stop_loss_order["candidate"],
+                                                                               PositionAction.CLOSE)
             else:
                 self.logger().info("Price changed. Close short position")
-                candidate_long = PerpetualOrderCandidate(trading_pair=self.trading_pair,
-                                                         is_maker=False,
-                                                         order_type=OrderType.MARKET,
-                                                         order_side=TradeType.BUY,
-                                                         amount=self.open_order.executed_amount_base,
-                                                         price=Decimal("NaN"),
-                                                         leverage=Decimal(self.leverage))
-                self.close_order_id = self.send_order_to_exchange(candidate_long, PositionAction.CLOSE)
+                self.closing_order["candidate"] = PerpetualOrderCandidate(trading_pair=self.trading_pair,
+                                                                          is_maker=False,
+                                                                          order_type=OrderType.MARKET,
+                                                                          order_side=TradeType.BUY,
+                                                                          amount=self.tracked_open_order.executed_amount_base,
+                                                                          price=Decimal("NaN"),
+                                                                          leverage=Decimal(self.leverage))
+                self.closing_order["order_id"] = self.send_order_to_exchange(self.closing_order["candidate"],
+                                                                             PositionAction.CLOSE)
 
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
         """
         Logs any info about created orders
         """
-        if event.order_id == self.short_level_order_id:
-            self.short_placed = True
+        if event.order_id == self.short_order["order_id"]:
+            self.short_order["placed"] = True
+            self.short_order["failed_counter"] = 0
             amount_usd = round(event.amount * event.price, 2)
             margin_usd = round(amount_usd / self.leverage, 2)
             self.notify_app_and_log(f"Short {self.short_sign}{self.trailing_short_percentage}% | "
                                     f"Price: {event.price} | Size: {event.amount} (${amount_usd}) | "
                                     f"margin ${margin_usd} | SL: {self.stop_loss_short_percentage}%")
-        elif event.order_id == self.stop_loss_order_id:
-            self.sl_placed = True
+        elif event.order_id == self.stop_loss_order["order_id"]:
+            self.stop_loss_order["placed"] = True
+            self.stop_loss_order["failed_counter"] = 0
             stop_loss_update_str = datetime.fromtimestamp(self.stop_loss_update_timestamp).strftime("%H:%M:%S")
             if self.check_num == 0:
                 self.check_num = 1
@@ -309,31 +333,36 @@ class BostonBot(ScriptStrategyBase):
                                         f"SL update: {self.stop_loss_long_percentage}%: {event.price} | "
                                         f"Next check No.1 {stop_loss_update_str}")
             else:
-                self.notify_app_and_log(f"Check no.{self.check_num-1} Long {self.long_sign}{self.trailing_long_percentage}% | "
-                                        f"Previous price: {round(self.previous_price, self.rounding_digits)} <= "
-                                        f"Current price: {round(self.current_price, self.rounding_digits)} | "
-                                        f"SL update: {self.stop_loss_long_percentage}%: {event.price} | "
-                                        f"Next check No.{self.check_num} {stop_loss_update_str}")
+                self.notify_app_and_log(
+                    f"Check no.{self.check_num - 1} Long {self.long_sign}{self.trailing_long_percentage}% | "
+                    f"Previous price: {round(self.previous_price, self.rounding_digits)} <= "
+                    f"Current price: {round(self.current_price, self.rounding_digits)} | "
+                    f"SL update: {self.stop_loss_long_percentage}%: {event.price} | "
+                    f"Next check No.{self.check_num} {stop_loss_update_str}")
             self.previous_price = self.current_price
-        elif event.order_id == self.close_order_id:
-            self.notify_app_and_log(f"Check no.{self.check_num-1} Long {self.long_sign}{self.trailing_long_percentage}% | "
-                                    f"Previous price: {round(self.previous_price, self.rounding_digits)} > "
-                                    f"Current price: {round(self.current_price, self.rounding_digits)} | "
-                                    f"Close with Market price")
+        elif event.order_id == self.closing_order["order_id"]:
+            self.closing_order["failed_counter"] = 0
+            self.notify_app_and_log(
+                f"Check no.{self.check_num - 1} Long {self.long_sign}{self.trailing_long_percentage}% | "
+                f"Previous price: {round(self.previous_price, self.rounding_digits)} > "
+                f"Current price: {round(self.current_price, self.rounding_digits)} | "
+                f"Close with Market price")
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         """
         Logs any info about created orders
         """
-        if event.order_id == self.long_level_order_id:
-            self.long_placed = True
+        if event.order_id == self.long_order["order_id"]:
+            self.long_order["placed"] = True
+            self.long_order["failed_counter"] = 0
             amount_usd = round(event.amount * event.price, 2)
             margin_usd = round(amount_usd / self.leverage, 2)
             self.notify_app_and_log(f"Long {self.long_sign}{self.trailing_long_percentage}% | "
                                     f"Price: {event.price} | Size: {event.amount} (${amount_usd}) | "
                                     f"margin ${margin_usd} | SL: {self.stop_loss_long_percentage}%")
-        elif event.order_id == self.stop_loss_order_id:
-            self.sl_placed = True
+        elif event.order_id == self.stop_loss_order["order_id"]:
+            self.stop_loss_order["placed"] = True
+            self.stop_loss_order["failed_counter"] = 0
             stop_loss_update_str = datetime.fromtimestamp(self.stop_loss_update_timestamp).strftime("%H:%M:%S")
             if self.check_num == 0:
                 self.check_num = 1
@@ -341,43 +370,73 @@ class BostonBot(ScriptStrategyBase):
                                         f"SL update: {self.stop_loss_short_percentage}%: {event.price} | "
                                         f"Next check No.1 {stop_loss_update_str}")
             else:
-                self.notify_app_and_log(f"Check no.{self.check_num-1} Short {self.short_sign}"
+                self.notify_app_and_log(f"Check no.{self.check_num - 1} Short {self.short_sign}"
                                         f"{self.trailing_short_percentage}% | "
                                         f"Previous price: {round(self.previous_price, self.rounding_digits)} >= "
                                         f"Current price: {round(self.current_price, self.rounding_digits)} | "
                                         f"SL update: {self.stop_loss_short_percentage}%: {event.price} | "
                                         f"Next check No.{self.check_num} {stop_loss_update_str}")
             self.previous_price = self.current_price
-        elif event.order_id == self.close_order_id:
-            self.notify_app_and_log(f"Check no.{self.check_num-1} Short {self.short_sign}{self.trailing_short_percentage}% | "
-                                    f"Previous price: {round(self.previous_price, self.rounding_digits)} < "
-                                    f"Current price: {round(self.current_price, self.rounding_digits)} | "
-                                    f"Close with Market price")
+        elif event.order_id == self.closing_order["order_id"]:
+            self.closing_order["failed_counter"] = 0
+            self.notify_app_and_log(
+                f"Check no.{self.check_num - 1} Short {self.short_sign}{self.trailing_short_percentage}% | "
+                f"Previous price: {round(self.previous_price, self.rounding_digits)} < "
+                f"Current price: {round(self.current_price, self.rounding_digits)} | "
+                f"Close with Market price")
 
     def did_cancel_order(self, event: OrderCancelledEvent):
-        if event.order_id == self.long_level_order_id:
-            self.long_placed = False
+        if event.order_id == self.long_order["order_id"]:
+            self.long_order["placed"] = False
             self.notify_app_and_log(f"Long {self.long_sign}{self.trailing_long_percentage}% cancelled ")
-        elif event.order_id == self.short_level_order_id:
-            self.short_placed = False
+        elif event.order_id == self.short_order["order_id"]:
+            self.short_order["placed"] = False
             self.notify_app_and_log(f"Short {self.short_sign}{self.trailing_short_percentage}% cancelled ")
-        elif event.order_id == self.stop_loss_order_id:
-            self.sl_placed = False
+        elif event.order_id == self.stop_loss_order["order_id"]:
+            self.stop_loss_order["placed"] = False
             self.notify_app_and_log(f"Stop Loss order cancelled")
-        elif event.order_id == self.close_order_id:
+        elif event.order_id == self.closing_order["order_id"]:
             self.notify_app_and_log(f"Close order cancelled")
 
+    def did_fail_order(self, event: MarketOrderFailureEvent):
+        if event.order_id == self.long_order["order_id"]:
+            self.failed_order_retry(self.long_order, "Long")
+        elif event.order_id == self.short_order["order_id"]:
+            self.failed_order_retry(self.short_order, "Short")
+        elif event.order_id == self.stop_loss_order["order_id"]:
+            self.failed_order_retry(self.stop_loss_order, "Stop loss")
+        elif event.order_id == self.closing_order["order_id"]:
+            self.failed_order_retry(self.closing_order, "Closing")
+
+    def failed_order_retry(self, order, order_type_str):
+        if order in (self.long_order, self.short_order):
+            trials_limit = self.failed_long_short_trials_limit
+            position_action = PositionAction.OPEN
+        else:
+            trials_limit = self.failed_stop_loss_trials_limit
+            position_action = PositionAction.CLOSE
+
+        if order["failed_counter"] < trials_limit:
+            order["failed_counter"] += 1
+            self.notify_app_and_log(f"Warning! {order_type_str} order failed to open. Trying again. "
+                                    f"Trial No {order['failed_counter']}")
+            time.sleep(1)
+            order["order_id"] = self.send_order_to_exchange(order["candidate"], position_action)
+        else:
+            self.notify_app_and_log(f"{order_type_str} trials limit reached. Stop trying")
+
     def did_fill_order(self, event: OrderFilledEvent):
-        if event.order_id in (self.long_level_order_id, self.short_level_order_id):
+        if event.order_id in (self.long_order["order_id"], self.short_order["order_id"]):
             self.status = BotStatus.POSITION_OPEN
             self.cancel_all_orders()
-            self.filled_position_side = TradeType.BUY if event.order_id == self.long_level_order_id else TradeType.SELL
-            self.open_order = self.connector._order_tracker.fetch_order(event.order_id)
-        elif event.order_id in (self.stop_loss_order_id, self.close_order_id):
+            self.filled_position_side = TradeType.BUY if event.order_id == self.long_order[
+                "order_id"] else TradeType.SELL
+            self.tracked_open_order = self.connector._order_tracker.fetch_order(event.order_id)
+        elif event.order_id in (self.stop_loss_order["order_id"], self.closing_order["order_id"]):
             self.logger().info(f"Stop loss filled or close with market order filled")
             self.next_cycle_timestamp = self.current_timestamp + self.timeout_sec
             self.status = BotStatus.TIMEOUT
-            self.close_order = self.connector._order_tracker.fetch_order(event.order_id)
+            self.tracked_close_order = self.connector._order_tracker.fetch_order(event.order_id)
         else:
             self.logger().info(f"Unknown order is filled. Event data = {event}")
             self.cancel_all_orders()
@@ -387,13 +446,13 @@ class BostonBot(ScriptStrategyBase):
         for position in self.account_positions.values():
             if position.trading_pair == self.trading_pair:
                 self.logger().info(f"account position = {position}")
-                self.previous_price = self.open_order.average_executed_price
+                self.previous_price = self.tracked_open_order.average_executed_price
                 if self.filled_position_side == TradeType.BUY:
                     self.notify_app_and_log(f"Long {self.long_sign}{self.trailing_long_percentage}% | Filled 100% | "
-                                            f"Entry price: {self.open_order.average_executed_price} ")
+                                            f"Entry price: {self.tracked_open_order.average_executed_price} ")
                 else:
                     self.notify_app_and_log(f"Short {self.short_sign}{self.trailing_short_percentage}% | Filled 100% | "
-                                            f"Entry price: {self.open_order.average_executed_price} ")
+                                            f"Entry price: {self.tracked_open_order.average_executed_price} ")
             else:
                 self.logger().info(f"No open positions found. Trying again.")
 
@@ -402,13 +461,12 @@ class BostonBot(ScriptStrategyBase):
         base, quote = split_hb_trading_pair(self.trading_pair)
         balance = round(self.connector.get_balance(quote), self.rounding_digits)
         side = "Long" if self.filled_position_side == TradeType.BUY else "Short"
-        entry_price = self.open_order.average_executed_price
-        close_price = self.close_order.average_executed_price
-        executed_amount_quote = self.open_order.executed_amount_base * entry_price
+        entry_price = self.tracked_open_order.average_executed_price
+        close_price = self.tracked_close_order.average_executed_price
+        executed_amount_quote = self.tracked_open_order.executed_amount_base * entry_price
         pnl = (close_price - entry_price) / entry_price if self.filled_position_side == TradeType.BUY \
             else (entry_price - close_price) / entry_price
         pnl_quote = pnl * executed_amount_quote
-        # fees = self.open_order.cum_fees + self.close_order.cum_fees
 
         self.notify_app_and_log(
             f"{side} | Closed | Entry price: {entry_price} | "
@@ -423,9 +481,9 @@ class BostonBot(ScriptStrategyBase):
         self.log_finalize_position_printed = False
         self.trailing_price_update_timestamp = self.server_time
         self.stop_loss_update_timestamp = 0
-        self.long_placed = False
-        self.short_placed = False
-        self.sl_placed = False
+        self.long_order["placed"] = False
+        self.short_order["placed"] = False
+        self.stop_loss_order["placed"] = False
 
     def is_open_positions_and_orders(self):
         for position in self.account_positions.values():
@@ -474,12 +532,16 @@ class BostonBot(ScriptStrategyBase):
             lines.extend(["", f"  Trailing price long:   {round(self.trailing_price_long, self.rounding_digits)}"])
             lines.extend([f"  Trailing price short:  {round(self.trailing_price_short, self.rounding_digits)}"])
             lines.extend([f"  Last price:  {round(last_price, self.rounding_digits)}"])
-            lines.extend([f"  Next price check:  {datetime.fromtimestamp(self.trailing_price_update_timestamp).strftime('%H:%M:%S')}"])
+            lines.extend([f"  Current server time:  {datetime.fromtimestamp(self.server_time).strftime('%H:%M:%S')}"])
+            lines.extend([
+                             f"  Next price check:  {datetime.fromtimestamp(self.trailing_price_update_timestamp).strftime('%H:%M:%S')}"])
             lines.extend([f"  Next price check in:  {update_sec} sec"])
         if self.status == BotStatus.POSITION_OPEN:
             update_sec = int(self.stop_loss_update_timestamp - self.server_time)
             lines.extend([f"  Last price:  {round(last_price, self.rounding_digits)}"])
-            lines.extend([f"  Next stop loss check:  {datetime.fromtimestamp(self.stop_loss_update_timestamp).strftime('%H:%M:%S')}"])
+            lines.extend([f"  Current server time:  {datetime.fromtimestamp(self.server_time).strftime('%H:%M:%S')}"])
+            lines.extend([
+                             f"  Next stop loss check:  {datetime.fromtimestamp(self.stop_loss_update_timestamp).strftime('%H:%M:%S')}"])
             lines.extend([f"  Next stop loss check in:  {update_sec} sec"])
 
         # balance_df = self.get_balance_df()
@@ -489,7 +551,8 @@ class BostonBot(ScriptStrategyBase):
             if position.trading_pair == self.trading_pair:
                 positions_df = self.active_positions_df()
                 lines.extend(
-                    ["", "  Active Positions:"] + ["    " + line for line in positions_df.to_string(index=False).split("\n")])
+                    ["", "  Active Positions:"] + ["    " + line for line in
+                                                   positions_df.to_string(index=False).split("\n")])
 
         try:
             orders_df = self.active_orders_df()
@@ -512,8 +575,8 @@ class BostonBot(ScriptStrategyBase):
                 order.trading_pair,
                 "buy" if order.is_buy else "sell",
                 float(order.price),
-                float(order.quantity),
-                ])
+                float(order.quantity)
+            ])
         if not data:
             raise ValueError
         df = pd.DataFrame(data=data, columns=columns)
@@ -535,4 +598,3 @@ class BostonBot(ScriptStrategyBase):
                 ]
             )
         return pd.DataFrame(data=data, columns=columns)
-
