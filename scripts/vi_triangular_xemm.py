@@ -29,6 +29,7 @@ class TriangularXEMM(ScriptStrategyBase):
     leftover_bid_pct = Decimal("0")
     leftover_ask_pct = Decimal("0")
 
+    trigger_arbitrage_on_base_change = True
     set_target_from_config = False
     target_base_amount = Decimal("0.01")
     target_quote_amount = Decimal("20")
@@ -50,6 +51,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
     order_delay = 10
     slippage_buffer = Decimal("1")
+    taker_order_type = OrderType.MARKET
 
     # Class params
     status: str = "NOT_INIT"
@@ -112,11 +114,20 @@ class TriangularXEMM(ScriptStrategyBase):
                 return
 
         # check for balances
+        is_maker_order_filled = False
         balance_diff_base = self.get_target_balance_diff(self.assets["maker_base"], self.target_base_amount)
-        balance_diff_base_quantize = self.connector.quantize_order_amount(self.taker_pair_1, abs(balance_diff_base))
+        balance_diff_quote = self.get_target_balance_diff(self.assets["maker_quote"], self.target_quote_amount)
 
-        if balance_diff_base_quantize != Decimal("0"):
-            balance_diff_quote = self.get_target_balance_diff(self.assets["maker_quote"], self.target_quote_amount)
+        if self.trigger_arbitrage_on_base_change:
+            amount_base_quantized = self.connector.quantize_order_amount(self.taker_pair_1, abs(balance_diff_base))
+        else:
+            amount_base = self.get_base_amount_for_quote_volume(self.maker_pair, True, abs(balance_diff_quote))
+            amount_base_quantized = self.connector.quantize_order_amount(self.taker_pair_1, amount_base)
+
+        if amount_base_quantized != Decimal("0"):
+            is_maker_order_filled = True
+
+        if is_maker_order_filled:
             if balance_diff_base > 0:
                 # bid was filled
                 taker_orders = self.get_taker_order_data(True, abs(balance_diff_base), abs(balance_diff_quote))
@@ -183,7 +194,7 @@ class TriangularXEMM(ScriptStrategyBase):
                 order_price = self.connector.get_price(self.fee_pair, True) * Decimal(1 + self.slippage_buffer / 100)
                 buy_fee_asset_candidate = OrderCandidate(trading_pair=self.fee_pair,
                                                          is_maker=True,
-                                                         order_type=OrderType.LIMIT,
+                                                         order_type=self.taker_order_type,
                                                          order_side=TradeType.BUY,
                                                          amount=fee_asset_diff_quantize,
                                                          price=order_price)
@@ -195,7 +206,7 @@ class TriangularXEMM(ScriptStrategyBase):
                 order_price = self.connector.get_price(self.fee_pair, False) * Decimal(1 - self.slippage_buffer / 100)
                 sell_fee_asset_candidate = OrderCandidate(trading_pair=self.fee_pair,
                                                           is_maker=True,
-                                                          order_type=OrderType.LIMIT,
+                                                          order_type=self.taker_order_type,
                                                           order_side=TradeType.SELL,
                                                           amount=fee_asset_diff_quantize,
                                                           price=order_price)
@@ -335,7 +346,7 @@ class TriangularXEMM(ScriptStrategyBase):
             taker_candidate = OrderCandidate(
                 trading_pair=taker_order["pair"][i],
                 is_maker=False,
-                order_type=OrderType.LIMIT,
+                order_type=self.taker_order_type,
                 order_side=side,
                 amount=amount,
                 price=price)
