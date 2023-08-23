@@ -17,15 +17,16 @@ class TriangularXEMM(ScriptStrategyBase):
     """
     # Config params
     connector_name: str = "kucoin"
-    maker_pair: str = "USDT-DAI"
-    taker_pair_1: str = "BTC-DAI"
-    taker_pair_2: str = "BTC-USDT"
+    maker_pair: str = "ETH-DAI"
+    taker_pair_1: str = "ETH-USDT"
+    taker_pair_2: str = "USDT-DAI"
 
     min_spread: Decimal = Decimal("1")
     max_spread: Decimal = Decimal("1.5")
 
-    order_amount: Decimal = Decimal("3")
-    min_order_amount = Decimal("1")
+    order_amount: Decimal = Decimal("0.4")
+    min_maker_order_amount = Decimal("0.2")
+    min_taker_order_amount = Decimal("0.002")
     leftover_bid_pct = Decimal("0")
     leftover_ask_pct = Decimal("0")
 
@@ -41,7 +42,7 @@ class TriangularXEMM(ScriptStrategyBase):
     fee_asset = "KCS"
     fee_asset_target_amount = Decimal("1")
     fee_pair = "KCS-USDT"
-    fee_asset_check_interval = 60
+    fee_asset_check_interval = 300
 
     kill_switch_enabled: bool = True
     kill_switch_asset = "USDT"
@@ -65,6 +66,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
     has_open_bid = False
     has_open_ask = False
+    maker_order_filled = False
     taker_candidates: list = []
     last_order_timestamp = 0
     place_order_trials_delay = 5
@@ -114,7 +116,6 @@ class TriangularXEMM(ScriptStrategyBase):
                 return
 
         # check for balances
-        is_maker_order_filled = False
         balance_diff_base = self.get_target_balance_diff(self.assets["maker_base"], self.target_base_amount)
         balance_diff_quote = self.get_target_balance_diff(self.assets["maker_quote"], self.target_quote_amount)
 
@@ -124,17 +125,19 @@ class TriangularXEMM(ScriptStrategyBase):
             amount_base = self.get_base_amount_for_quote_volume(self.maker_pair, True, abs(balance_diff_quote))
             amount_base_quantized = self.connector.quantize_order_amount(self.taker_pair_1, amount_base)
 
-        if amount_base_quantized != Decimal("0"):
-            is_maker_order_filled = True
-
-        if is_maker_order_filled:
-            if balance_diff_base > 0:
-                # bid was filled
-                taker_orders = self.get_taker_order_data(True, abs(balance_diff_base), abs(balance_diff_quote))
+        if amount_base_quantized > self.min_taker_order_amount:
+            # Maker order is filled start arbitrage
+            if self.trigger_arbitrage_on_base_change:
+                bid_was_filled = True if balance_diff_base > 0 else False
             else:
-                # ask was filled
-                taker_orders = self.get_taker_order_data(False, abs(balance_diff_base), abs(balance_diff_quote))
+                bid_was_filled = True if balance_diff_quote < 0 else False
+
+            taker_orders = self.get_taker_order_data(bid_was_filled, abs(balance_diff_base), abs(balance_diff_quote))
             self.place_taker_orders(taker_orders)
+            return
+
+        if self.maker_order_filled:
+            self.cancel_all_orders()
             return
 
         # open maker orders
@@ -275,6 +278,7 @@ class TriangularXEMM(ScriptStrategyBase):
         self.notify_hb_app_with_timestamp(msg)
         self.log_with_clock(logging.WARNING, msg)
         self.status = "ACTIVE"
+        self.maker_order_filled = False
 
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
@@ -365,9 +369,7 @@ class TriangularXEMM(ScriptStrategyBase):
                                            order_side=TradeType.BUY,
                                            amount=self.order_amount,
                                            price=order_price)
-            place_result = self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
-            if place_result:
-                self.log_with_clock(logging.INFO, "Placed maker BUY order")
+            self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
 
         if not self.has_open_ask and self.place_ask:
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
@@ -378,9 +380,7 @@ class TriangularXEMM(ScriptStrategyBase):
                 order_side=TradeType.SELL,
                 amount=self.order_amount,
                 price=order_price)
-            place_result = self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
-            if place_result:
-                self.log_with_clock(logging.INFO, "Placed maker SELL order")
+            self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
 
     def adjust_and_place_order(self, candidate, all_or_none):
         candidate_adjusted = self.connector.budget_checker.adjust_candidate(candidate, all_or_none=all_or_none)
@@ -393,10 +393,10 @@ class TriangularXEMM(ScriptStrategyBase):
                                     f" {candidate_adjusted.order_type.name} order")
             return False
         if candidate_adjusted.trading_pair == self.maker_pair and candidate_adjusted.amount < Decimal(
-                self.min_order_amount):
+                self.min_maker_order_amount):
             self.log_with_clock(logging.INFO,
                                 f"Order candidate maker amount = {candidate_adjusted.amount} is less "
-                                f"than min_order_amount {self.min_order_amount}. "
+                                f"than min_maker_order_amount {self.min_maker_order_amount}. "
                                 f"Can't create {candidate_adjusted.order_side.name}"
                                 f" {candidate_adjusted.order_type.name} order")
             return False
@@ -496,16 +496,18 @@ class TriangularXEMM(ScriptStrategyBase):
         return Decimal(cumulative_base_amount)
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"Buy order is created on the market {event.trading_pair}")
+        self.log_with_clock(logging.INFO, f"did_create_buy_order event arrived on {event.trading_pair}")
         self.check_and_remove_taker_candidates(event, TradeType.BUY)
 
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"Sell order is created on the market {event.trading_pair}")
+        self.log_with_clock(logging.INFO, f"did_create_sell_order event arrived on {event.trading_pair}")
         self.check_and_remove_taker_candidates(event, TradeType.SELL)
 
     def did_fill_order(self, event: OrderFilledEvent):
+        if event.trading_pair == self.maker_pair:
+            self.maker_order_filled = True
         self.check_and_remove_taker_candidates(event, event.trade_type)
-        msg = (f"{event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
+        msg = (f"did_fill_order event {event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
                f"at {round(event.price, 5)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
