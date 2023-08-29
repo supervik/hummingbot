@@ -5,7 +5,8 @@ import pandas as pd
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent
+from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent, \
+    MarketOrderFailureEvent
 from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
 
 
@@ -21,8 +22,8 @@ class TriangularXEMM(ScriptStrategyBase):
     taker_pair_1: str = "ETH-USDT"
     taker_pair_2: str = "USDT-DAI"
 
-    min_spread: Decimal = Decimal("1")
-    max_spread: Decimal = Decimal("1.5")
+    min_spread: Decimal = Decimal("0.5")
+    max_spread: Decimal = Decimal("1")
 
     order_amount: Decimal = Decimal("0.4")
     min_maker_order_amount = Decimal("0.2")
@@ -30,7 +31,7 @@ class TriangularXEMM(ScriptStrategyBase):
     leftover_bid_pct = Decimal("0")
     leftover_ask_pct = Decimal("0")
 
-    trigger_arbitrage_on_base_change = True
+    trigger_arbitrage_on_base_change = False
     set_target_from_config = False
     target_base_amount = Decimal("0.01")
     target_quote_amount = Decimal("20")
@@ -124,12 +125,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
         if amount_base_quantized > self.min_taker_order_amount:
             # Maker order is filled start arbitrage
-            if self.trigger_arbitrage_on_base_change:
-                bid_was_filled = True if balance_diff_base > 0 else False
-            else:
-                bid_was_filled = True if balance_diff_quote < 0 else False
-
-            taker_orders = self.get_taker_order_data(bid_was_filled, abs(balance_diff_base), abs(balance_diff_quote))
+            taker_orders = self.get_taker_order_data(balance_diff_base, balance_diff_quote)
             self.place_taker_orders(taker_orders)
             return
 
@@ -279,38 +275,36 @@ class TriangularXEMM(ScriptStrategyBase):
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
         amount_diff = current_balance - target_amount
-        # self.log_with_clock(logging.INFO, f"Current balance {asset}: {current_balance}, "
-        #                                   f"Target balance: {target_amount}, "
-        #                                   f"Amount_diff: {amount_diff}")
         return amount_diff
 
-    def get_taker_order_data(self, is_maker_bid, balances_diff_base, balances_diff_quote):
-        if self.assets["taker_1_base"] == self.assets["taker_2_base"]:
-            if self.assets["taker_1_quote"] == self.assets["maker_quote"]:
-                taker_side_1 = not is_maker_bid
-                taker_side_2 = is_maker_bid
-                taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
-                                                                       balances_diff_quote)
-                taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
-                                                                       balances_diff_base)
-            else:
-                taker_side_1 = is_maker_bid
-                taker_side_2 = not is_maker_bid
-                taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
-                                                                       balances_diff_base)
-                taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
-                                                                       balances_diff_quote)
-        else:
-            taker_side_1 = not is_maker_bid
-            taker_amount_1 = balances_diff_base
+    def get_taker_order_data(self, balances_diff_base, balances_diff_quote):
+        # if self.assets["taker_1_base"] == self.assets["taker_2_base"]:
+        #     if self.assets["taker_1_quote"] == self.assets["maker_quote"]:
+        #         taker_side_1 = not is_maker_bid
+        #         taker_side_2 = is_maker_bid
+        #         taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
+        #                                                                balances_diff_quote)
+        #         taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+        #                                                                balances_diff_base)
+        #     else:
+        #         taker_side_1 = is_maker_bid
+        #         taker_side_2 = not is_maker_bid
+        #         taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
+        #                                                                balances_diff_base)
+        #         taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+        #                                                                balances_diff_quote)
+        # else:
 
-            if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
-                taker_side_2 = True if is_maker_bid else False
-                taker_amount_2 = balances_diff_quote
-            else:
-                taker_side_2 = False if is_maker_bid else True
-                taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
-                                                                       balances_diff_quote)
+        taker_side_1 = False if balances_diff_base > 0 else True
+        taker_amount_1 = abs(balances_diff_base)
+
+        if self.assets["maker_quote"] == self.assets["taker_2_base"]:
+            taker_side_2 = False if balances_diff_quote > 0 else True
+            taker_amount_2 = abs(balances_diff_quote)
+        else:
+            taker_side_2 = True if balances_diff_quote > 0 else False
+            taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
+                                                                   abs(balances_diff_quote))
 
         taker_price_1 = self.connector.get_price_for_volume(self.taker_pair_1, taker_side_1,
                                                             taker_amount_1).result_price
