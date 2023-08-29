@@ -56,9 +56,6 @@ class TriangularXEMM(ScriptStrategyBase):
 
     # Class params
     status: str = "NOT_INIT"
-    taker_pairs: tuple = ()
-    taker_order_sides: dict = {}
-    taker_price_calculation_method: int = 0
     taker_sell_price = 0
     taker_buy_price = 0
     spread = 0
@@ -69,7 +66,7 @@ class TriangularXEMM(ScriptStrategyBase):
     maker_order_filled = False
     taker_candidates: list = []
     last_order_timestamp = 0
-    place_order_trials_delay = 5
+    place_order_trials_delay = 10
     place_order_trials_limit = 10
     last_fee_asset_check_timestamp = 0
     kill_switch_check_timestamp = 0
@@ -137,7 +134,6 @@ class TriangularXEMM(ScriptStrategyBase):
             return
 
         if self.maker_order_filled:
-            self.cancel_all_orders()
             return
 
         # open maker orders
@@ -497,17 +493,21 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         self.log_with_clock(logging.INFO, f"did_create_buy_order event arrived on {event.trading_pair}")
-        self.check_and_remove_taker_candidates(event, TradeType.BUY)
+        if event.trading_pair != self.maker_pair:
+            self.check_and_remove_taker_candidates(event, TradeType.BUY)
 
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
         self.log_with_clock(logging.INFO, f"did_create_sell_order event arrived on {event.trading_pair}")
-        self.check_and_remove_taker_candidates(event, TradeType.SELL)
+        if event.trading_pair != self.maker_pair:
+            self.check_and_remove_taker_candidates(event, TradeType.SELL)
 
     def did_fill_order(self, event: OrderFilledEvent):
         if event.trading_pair == self.maker_pair:
             self.maker_order_filled = True
-        self.check_and_remove_taker_candidates(event, event.trade_type)
-        msg = (f"did_fill_order event {event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
+            self.cancel_all_orders()
+        else:
+            self.check_and_remove_taker_candidates(event, event.trade_type)
+        msg = (f"fill {event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
                f"at {round(event.price, 5)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
