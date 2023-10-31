@@ -55,6 +55,7 @@ class TriangularXEMM(ScriptStrategyBase):
     fee_tracking_enabled = True
     fee_asset = "KCS"
     fee_asset_target_amount = Decimal("2")
+    fee_asset_min_order_amount = Decimal("0.2")
     fee_pair = "KCS-USDT"
     fee_asset_check_interval = 300
 
@@ -208,7 +209,7 @@ class TriangularXEMM(ScriptStrategyBase):
         fee_asset_diff = self.get_target_balance_diff(self.fee_asset, self.fee_asset_target_amount)
         fee_asset_diff_quantize = self.connector.quantize_order_amount(self.fee_pair, abs(fee_asset_diff))
 
-        if fee_asset_diff_quantize != Decimal("0"):
+        if fee_asset_diff_quantize > self.fee_asset_min_order_amount:
             if fee_asset_diff < 0:
                 order_price = self.connector.get_price(self.fee_pair, True) * Decimal(1 + self.slippage_buffer / 100)
                 buy_fee_asset_candidate = OrderCandidate(trading_pair=self.fee_pair,
