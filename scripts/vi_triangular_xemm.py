@@ -1,4 +1,8 @@
+import csv
 import logging
+import os
+import time
+from enum import Enum
 
 import pandas as pd
 
@@ -6,8 +10,17 @@ from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent, \
-    MarketOrderFailureEvent
+    MarketOrderFailureEvent, BuyOrderCompletedEvent, SellOrderCompletedEvent, OrderCancelledEvent
 from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
+
+
+class OrderState(Enum):
+    PENDING_CREATE = 0
+    CREATED = 1
+    PENDING_CANCEL = 2
+    CANCELED = 3
+    PENDING_EXECUTE = 4
+    EXECUTED = 5
 
 
 class TriangularXEMM(ScriptStrategyBase):
@@ -41,19 +54,20 @@ class TriangularXEMM(ScriptStrategyBase):
 
     fee_tracking_enabled = True
     fee_asset = "KCS"
-    fee_asset_target_amount = Decimal("1")
+    fee_asset_target_amount = Decimal("2")
     fee_pair = "KCS-USDT"
     fee_asset_check_interval = 300
 
     kill_switch_enabled: bool = True
     kill_switch_asset = "USDT"
-    kill_switch_rate = Decimal("-1")
+    kill_switch_rate = Decimal("-3")
     kill_switch_check_interval = 60
     kill_switch_counter_limit = 5
 
-    order_delay = 10
+    order_delay = 15
     slippage_buffer = Decimal("1")
     taker_order_type = OrderType.MARKET
+    test_latency = True
 
     # Class params
     status: str = "NOT_INIT"
@@ -85,6 +99,16 @@ class TriangularXEMM(ScriptStrategyBase):
         The only connector in this strategy, define it here for easy access
         """
         return self.connectors[self.connector_name]
+
+    @property
+    def timestamp_now(self):
+        """Returns the current timestamp in milliseconds."""
+        return int(time.time() * 1e3)
+
+    @property
+    def filename(self):
+        """Generates the filename for the CSV based on the connector name and trading_pair."""
+        return f"data/tri_xemm_{self.connector_name}_{self.maker_pair}_latency_test.csv"
 
     def on_tick(self):
         """
@@ -278,23 +302,6 @@ class TriangularXEMM(ScriptStrategyBase):
         return amount_diff
 
     def get_taker_order_data(self, balances_diff_base, balances_diff_quote):
-        # if self.assets["taker_1_base"] == self.assets["taker_2_base"]:
-        #     if self.assets["taker_1_quote"] == self.assets["maker_quote"]:
-        #         taker_side_1 = not is_maker_bid
-        #         taker_side_2 = is_maker_bid
-        #         taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
-        #                                                                balances_diff_quote)
-        #         taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
-        #                                                                balances_diff_base)
-        #     else:
-        #         taker_side_1 = is_maker_bid
-        #         taker_side_2 = not is_maker_bid
-        #         taker_amount_1 = self.get_base_amount_for_quote_volume(self.taker_pair_1, taker_side_1,
-        #                                                                balances_diff_base)
-        #         taker_amount_2 = self.get_base_amount_for_quote_volume(self.taker_pair_2, taker_side_2,
-        #                                                                balances_diff_quote)
-        # else:
-
         taker_side_1 = False if balances_diff_base > 0 else True
         taker_amount_1 = abs(balances_diff_base)
 
@@ -399,19 +406,28 @@ class TriangularXEMM(ScriptStrategyBase):
         self.place_order(candidate_adjusted)
         return True
 
-    def place_order(self, candidate_adjusted):
-        if candidate_adjusted.order_side == TradeType.BUY:
-            self.buy(
-                self.connector_name, candidate_adjusted.trading_pair, candidate_adjusted.amount,
-                candidate_adjusted.order_type, candidate_adjusted.price)
+    def place_order(self, candidate):
+        time_before_order_sent = self.timestamp_now
+
+        if candidate.order_side == TradeType.BUY:
+            order_id = self.buy(
+                self.connector_name, candidate.trading_pair, candidate.amount,
+                candidate.order_type, candidate.price)
         else:
-            self.sell(
-                self.connector_name, candidate_adjusted.trading_pair, candidate_adjusted.amount,
-                candidate_adjusted.order_type, candidate_adjusted.price)
+            order_id = self.sell(
+                self.connector_name, candidate.trading_pair, candidate.amount,
+                candidate.order_type, candidate.price)
+
+        status = OrderState.PENDING_CREATE if candidate.order_type == OrderType.LIMIT else OrderState.PENDING_EXECUTE
+        self.save_to_csv(time_before_order_sent, order_id, status.name)
 
     def cancel_all_orders(self):
         for order in self.get_active_orders(self.connector_name):
-            self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
+            self.cancel_order_by_id(self.connector_name, order.trading_pair, order.client_order_id)
+
+    def cancel_order_by_id(self, connector, pair, order_id):
+        self.save_to_csv(self.timestamp_now, order_id, OrderState.PENDING_CANCEL.name)
+        self.cancel(connector, pair, order_id)
 
     def calculate_taker_price(self, is_maker_bid):
         if self.assets["taker_1_base"] == self.assets["taker_2_base"]:
@@ -447,7 +463,7 @@ class TriangularXEMM(ScriptStrategyBase):
                 if order.price > upper_price or order.price < lower_price:
                     self.log_with_clock(logging.INFO, f"BUY order price {order.price} is not in the range "
                                                       f"{lower_price} - {upper_price}. Cancelling order.")
-                    self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
+                    self.cancel_order_by_id(self.connector_name, order.trading_pair, order.client_order_id)
                     return True
             else:
                 self.has_open_ask = True
@@ -456,7 +472,7 @@ class TriangularXEMM(ScriptStrategyBase):
                 if order.price > upper_price or order.price < lower_price:
                     self.log_with_clock(logging.INFO, f"SELL order price {order.price} is not in the range "
                                                       f"{lower_price} - {upper_price}. Cancelling order.")
-                    self.cancel(self.connector_name, order.trading_pair, order.client_order_id)
+                    self.cancel_order_by_id(self.connector_name, order.trading_pair, order.client_order_id)
                     return True
         return False
 
@@ -486,13 +502,15 @@ class TriangularXEMM(ScriptStrategyBase):
         return Decimal(cumulative_base_amount)
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"did_create_buy_order event arrived on {event.trading_pair}")
-        if event.trading_pair != self.maker_pair:
+        if event.trading_pair == self.maker_pair:
+            self.save_to_csv(self.timestamp_now, event.order_id, OrderState.CREATED.name)
+        else:
             self.check_and_remove_taker_candidates(event, TradeType.BUY)
 
     def did_create_sell_order(self, event: SellOrderCreatedEvent):
-        self.log_with_clock(logging.INFO, f"did_create_sell_order event arrived on {event.trading_pair}")
-        if event.trading_pair != self.maker_pair:
+        if event.trading_pair == self.maker_pair:
+            self.save_to_csv(self.timestamp_now, event.order_id, OrderState.CREATED.name)
+        else:
             self.check_and_remove_taker_candidates(event, TradeType.SELL)
 
     def did_fill_order(self, event: OrderFilledEvent):
@@ -505,6 +523,18 @@ class TriangularXEMM(ScriptStrategyBase):
                f"at {round(event.price, 5)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
+
+    def did_complete_buy_order(self, event: BuyOrderCompletedEvent):
+        if f"{event.base_asset}-{event.quote_asset}" != self.maker_pair:
+            self.save_to_csv(self.timestamp_now, event.order_id, OrderState.EXECUTED.name)
+
+    def did_complete_sell_order(self, event: SellOrderCompletedEvent):
+        if f"{event.base_asset}-{event.quote_asset}" != self.maker_pair:
+            self.save_to_csv(self.timestamp_now, event.order_id, OrderState.EXECUTED.name)
+
+    def did_cancel_order(self, event: OrderCancelledEvent):
+        """Logs the post-transmission timestamp when a confirmation of order cancelled is received."""
+        self.save_to_csv(self.timestamp_now, event.order_id, OrderState.CANCELED.name)
 
     def check_and_remove_taker_candidates(self, filled_event, trade_type):
         candidates = self.taker_candidates.copy()
@@ -560,9 +590,10 @@ class TriangularXEMM(ScriptStrategyBase):
             return "Market connectors are not ready."
         lines = []
 
-        lines.extend(["", "  Strategy status:"] + ["    " + self.status])
-        lines.extend(["", "  Target amounts:"] + ["    " + f"{self.target_base_amount} {self.assets['maker_base']} "
-                                                           f"{self.target_quote_amount} {self.assets['maker_quote']}"])
+        lines.extend([f"  Strategy status:  {self.status}"])
+        lines.extend([f"  Trading pairs:    {self.maker_pair}, {self.taker_pair_1}, {self.taker_pair_2}"])
+        lines.extend([f"  Target amounts:   {self.target_base_amount} {self.assets['maker_base']}, "
+                      f"{self.target_quote_amount} {self.assets['maker_quote']}"])
 
         balance_df = self.get_balance_df()
         lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
@@ -575,3 +606,16 @@ class TriangularXEMM(ScriptStrategyBase):
             lines.extend(["", "  No active maker orders."])
 
         return "\n".join(lines)
+
+    def save_to_csv(self, timestamp, order_id, status):
+        """Appends the provided data to the CSV file. If the file doesn't exist, it creates one."""
+        if self.test_latency:
+            file_exists = os.path.exists(self.filename)
+
+            with open(self.filename, 'a', newline='') as csvfile:
+                fieldnames = ['Timestamp', 'Order_ID', 'Status']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerow({'Timestamp': timestamp, 'Order_ID': order_id, 'Status': status})
