@@ -69,6 +69,7 @@ class TriangularXEMM(ScriptStrategyBase):
     slippage_buffer = Decimal("1")
     taker_order_type = OrderType.MARKET
     test_latency = True
+    max_order_age = 300
 
     # Class params
     status: str = "NOT_INIT"
@@ -109,7 +110,7 @@ class TriangularXEMM(ScriptStrategyBase):
     @property
     def filename(self):
         """Generates the filename for the CSV based on the connector name and trading_pair."""
-        return f"data/tri_xemm_{self.connector_name}_{self.maker_pair}_latency_test.csv"
+        return f"data/latency_test_tri_xemm_{self.connector_name}_{self.maker_pair}.csv"
 
     def on_tick(self):
         """
@@ -457,22 +458,21 @@ class TriangularXEMM(ScriptStrategyBase):
         self.has_open_bid = False
         self.has_open_ask = False
         for order in self.get_active_orders(connector_name=self.connector_name):
+            cancel_timestamp = order.creation_timestamp / 1000000 + self.max_order_age
             if order.is_buy:
                 self.has_open_bid = True
                 upper_price = self.taker_sell_price * Decimal(1 - self.min_spread / 100)
                 lower_price = self.taker_sell_price * Decimal(1 - self.max_spread / 100)
-                if order.price > upper_price or order.price < lower_price:
-                    self.log_with_clock(logging.INFO, f"BUY order price {order.price} is not in the range "
-                                                      f"{lower_price} - {upper_price}. Cancelling order.")
+                if order.price > upper_price or order.price < lower_price or self.current_timestamp > cancel_timestamp:
+                    self.log_with_clock(logging.INFO, f"BUY Order {order.client_order_id} is out of price range or too old")
                     self.cancel_order_by_id(self.connector_name, order.trading_pair, order.client_order_id)
                     return True
             else:
                 self.has_open_ask = True
                 upper_price = self.taker_buy_price * Decimal(1 + self.max_spread / 100)
                 lower_price = self.taker_buy_price * Decimal(1 + self.min_spread / 100)
-                if order.price > upper_price or order.price < lower_price:
-                    self.log_with_clock(logging.INFO, f"SELL order price {order.price} is not in the range "
-                                                      f"{lower_price} - {upper_price}. Cancelling order.")
+                if order.price > upper_price or order.price < lower_price or self.current_timestamp > cancel_timestamp:
+                    self.log_with_clock(logging.INFO, f"SELL Order {order.client_order_id} is out of price range or too old")
                     self.cancel_order_by_id(self.connector_name, order.trading_pair, order.client_order_id)
                     return True
         return False
