@@ -6,7 +6,8 @@ import pandas as pd
 
 # Load the CSV file into a pandas DataFrame
 directory = 'trades'
-filename = 'trades_triangular_xemm_multi_kucoin_BTC_USDT_spread_diff.csv'
+filename = 'trades_vi_triangular_xemm_ETH_USDT_ku.csv'
+ignore_asset = "KCS"
 # df = pd.read_csv('trades_triangular_xemm_mul.csv')
 df = pd.read_csv(f'{directory}/{filename}')
 
@@ -24,6 +25,7 @@ df['trading_round'] = (df['time_diff'] > 5).cumsum()
 
 # Remove temporary 'time_diff' column
 df.drop('time_diff', axis=1, inplace=True)
+df = df[~df['symbol'].str.contains(ignore_asset)]
 
 # Group by 'trading_round' and count the unique 'symbol' for each group
 unique_symbols_per_round = df.groupby('trading_round')['symbol'].nunique()
@@ -40,6 +42,7 @@ df_grouped = df_clean.groupby(['trading_round', 'symbol']).agg(
     base_asset=('base_asset', 'first'),
     quote_asset=('quote_asset', 'first'),
     trade_type=('trade_type', 'first'),
+    amount=('amount', 'sum'),
     average_price=('price', 'mean')).reset_index()
 
 # Sort the DataFrame by 'timestamp'
@@ -53,7 +56,7 @@ def calculate_performance(group):
     # Sort the group by timestamp to make sure the trades are in order
     group = group.sort_values('timestamp')
 
-    # The first trade in the round is the initial asset BUY price
+    # The first trade in the round is the initial asset BUY or SELL price
     buy_price = group.iloc[0]['average_price']
 
     # Calculate the SELL price based on the second and third trades
@@ -71,10 +74,28 @@ def calculate_performance(group):
     else:
         performance = 100 * (buy_price / sell_price - 1)
 
+    # Subtract fee from performance
+    performance = performance - 0.24
+
+    # calculate the traded amount in quote currency
+    quote_amount = group.iloc[0]['amount'] * group.iloc[0]['average_price']
+
+    # calculate the performance in quote currency
+    performance_quote = quote_amount * performance * 0.01
+    performance_base = group.iloc[0]['amount'] * performance * 0.01
+
     return pd.Series({
         'timestamp': group['timestamp'].min(),
-        # 'triangle_symbols': group['symbol'].tolist(),
-        'triangle_symbols': group.iloc[0]['symbol'],
+        'triangle_symbol': group.iloc[0]['symbol'],
+        'trade_type': group.iloc[0]['trade_type'],
+        # f'{group.iloc[0]["base_asset"]}_amount': group.iloc[0]['amount'],
+        # f'{group.iloc[0]["quote_asset"]}_amount': quote_amount,
+        # f'performance_{group.iloc[0]["base_asset"]}': performance_base,
+        # f'performance_{group.iloc[0]["quote_asset"]}': performance_quote,
+        'base_amount': group.iloc[0]['amount'],
+        'quote_amount': quote_amount,
+        'performance_base': performance_base,
+        'performance_quote': performance_quote,
         'performance': performance
     })
 
@@ -82,10 +103,12 @@ def calculate_performance(group):
 df_performance = df_sorted.groupby('trading_round').apply(calculate_performance).reset_index()
 
 # Subtract fee from performance
-df_performance['performance'] = df_performance['performance'] - 0.24
+# df_performance['performance'] = df_performance['performance'] - 0.24
+
+# Print dataframe
+print(df_performance.tail(20))
 
 # Save the DataFrame to an Excel file
 df_performance.to_excel(f'{directory}/performance_{filename}.xlsx', index=False)
 
-# Print dataframe
-print(df_performance)
+
