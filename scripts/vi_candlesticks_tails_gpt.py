@@ -3,6 +3,7 @@ import datetime
 import sys
 import pandas as pd
 import os
+from collections import Counter
 
 
 # --------------------
@@ -10,13 +11,17 @@ import os
 # --------------------
 CONFIG = {
     "exchange_name": "binance",
-    "days": 5,
+    "days": 7,
     "limit_pairs": False,
     "limit_pairs_threshold": 20,
-    "get_upper_tail": True,
+    "get_upper_tail": False,
     "get_lower_tail": True,
-    'get_pairs_from_list': False,
-    'pairs_list': ['XMR-ETH', 'XMR-BTC']
+    'get_pairs_from_list': True,
+    'pairs_list': ['LINK/ETH', 'LINK/USDT'],
+    # 'pairs_list': ['LINK/ETH', 'LINK/USDT', 'KAVA/BTC', 'KAVA/USDT', 'DOGE/BTC', 'DOGE/USDT', 'TRX/BTC', 'TRX/USDT',
+    #                'ETH/BTC', 'ETH/USDT', 'ADA/BTC', 'ADA/USDT', 'QTUM/BTC', 'QTUM/USDT'],
+    'save_to_file': True,
+    'filter_triangles': True
 }
 
 # --------------------
@@ -85,23 +90,23 @@ def get_volume_in_usd(exchange, pair):
         base_currency, quote_currency = pair.split('/')
 
         if "USD" in quote_currency:
-            return volume_quote
+            return int(volume_quote)
         elif "USD" in base_currency:
-            return volume
+            return int(volume)
         else:
             # Try to fetch the equivalent USDT pair for the base currency to convert the volume
             base_usd_pair = f"{base_currency}/USDT"
             if base_usd_pair in exchange.symbols:
                 usd_ticker_data = exchange.fetch_ticker(base_usd_pair)
                 usd_price = usd_ticker_data.get('last', 1)  # If not found, assume price of 1 to avoid division by zero
-                return volume * usd_price
+                return int(volume * usd_price)
             else:
                 # If base/USDT pair doesn't exist, try the quote/USDT pair
                 quote_usd_pair = f"{quote_currency}/USDT"
                 if quote_usd_pair in exchange.symbols:
                     usd_ticker_data = exchange.fetch_ticker(quote_usd_pair)
                     usd_price = usd_ticker_data.get('last', 1)
-                    return volume / usd_price  # Use division as we are converting base volume using quote price
+                    return int(volume / usd_price)  # Use division as we are converting base volume using quote price
                 else:
                     return None
     except Exception as e:
@@ -109,12 +114,25 @@ def get_volume_in_usd(exchange, pair):
         return None
 
 
-def main(exchange_name, days, limit_pairs, limit_pairs_threshold, get_upper_tail, get_lower_tail, get_pairs_from_list, pairs_list):
+def filter_triangles_pairs(pairs):
+    """Get only pairs that can form a triangle. This is done by filtering out pairs with unique base assets"""
+    first_currencies = [pair.split('/')[0] for pair in pairs]
+    base_asset_counts = Counter(first_currencies)
+    filtered_pairs = [pair for pair in pairs if base_asset_counts[pair.split('/')[0]] > 1]
+    return filtered_pairs
+
+
+def main(exchange_name, days, limit_pairs, limit_pairs_threshold, get_upper_tail, get_lower_tail, get_pairs_from_list,
+         pairs_list, save_to_file, filter_triangles):
     exchange = getattr(ccxt, exchange_name)()
     print(f"Start getting trading pairs for {exchange_name}")
     pairs = pairs_list if get_pairs_from_list else get_trading_pairs(exchange)
     pairs = [pair for pair in pairs if ':' not in pair]
     print(f"{len(pairs)} pairs found")
+    if filter_triangles:
+        pairs = filter_triangles_pairs(pairs)
+        print(f"{len(pairs)} pairs filtered for triangles")
+
     total_pairs = limit_pairs_threshold if limit_pairs else len(pairs)
     results = []
 
@@ -150,7 +168,16 @@ def main(exchange_name, days, limit_pairs, limit_pairs_threshold, get_upper_tail
     if not os.path.exists(directory):
         os.makedirs(directory)
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
-    results_df.to_excel(f'{directory}/tails_{exchange_name}_{timestamp}.xlsx', index=False)
+    suffix = 'both'
+    if not get_lower_tail:
+        suffix = 'upper'
+    if not get_upper_tail:
+        suffix = 'lower'
+    if filter_triangles:
+        suffix += '_filtered'
+
+    if save_to_file:
+        results_df.to_excel(f'{directory}/tails_{exchange_name}_{timestamp}_{suffix}.xlsx', index=False)
 
 
 if __name__ == "__main__":
