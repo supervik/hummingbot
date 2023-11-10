@@ -27,16 +27,21 @@ class LatencyTest(ScriptStrategyBase):
     It places both market and limit orders at regular intervals and logs the time taken for various states.
     """
     # Configuration parameters
-    trading_pair = "BNB-ETH"
-    connector_name = "binance"
-    order_amount = Decimal("0.01")
+    trading_pair = "KCS-USDT"
+    connector_name = "kucoin"
+    order_amount = Decimal("0.2")
     order_spread = Decimal("5")  # Percentage distance to place limit orders from the current price
     test_create_latency = True  # Flag to enable testing creation and cancellation latency
     test_execute_latency = True  # Flag to enable testing execution latency
     create_interval = 30  # Time interval (in seconds) between limit order creations
     execute_interval = 300  # Time interval (in seconds) between market order executions
     delay = 5  # Time delay (in seconds) to avoid multiple requests being sent simultaneously
-    csv_file_id = "aws_tokyo"  # Identifier for distinct CSV filenames
+    csv_file_id = "pro_test"  # Identifier for distinct CSV filenames
+    run_with_pauses = False
+    run_time = 140  # Duration for which the program runs
+    rest_time = 10  # Pause duration after the program run before another program proceed
+    cycle_count = 4  # Total number of cycles in one full pattern
+    current_cycle_index = 1  # Index of the current cycle
 
     markets = {connector_name: {trading_pair}}
 
@@ -45,6 +50,7 @@ class LatencyTest(ScriptStrategyBase):
     execute_timestamp = 0
     delay_timestamp = 0
     order_filled = False
+    pause_info_printed = False
 
     @property
     def connector(self):
@@ -77,6 +83,14 @@ class LatencyTest(ScriptStrategyBase):
             self.cancel_all_orders()
             return
 
+        if self.run_with_pauses and self.is_pause():
+            if not self.pause_info_printed:
+                self.log_with_clock(logging.INFO, f"Pause")
+                self.pause_info_printed = True
+            return
+
+        self.pause_info_printed = False
+
         # Execute market order if conditions are met
         if self.test_execute_latency and self.current_timestamp > self.execute_timestamp:
             self.delay_timestamp = self.current_timestamp + self.delay
@@ -90,6 +104,23 @@ class LatencyTest(ScriptStrategyBase):
             self.delay_timestamp = self.current_timestamp + self.delay
             self.create_timestamp = self.current_timestamp + self.create_interval
             self.place_order(is_maker=True)
+
+    def is_pause(self):
+        """
+        Determine if the program should run at the given time based on the offset, repeat and run parameters
+        """
+        # current_seconds = self.current_timestamp % 3600
+        # delta = (current_seconds - self.offset_seconds) % self.repeat_seconds
+        # 
+        # return delta < 0 or delta >= self.run_time
+        single_cycle_duration = self.run_time + self.rest_time
+        full_pattern_duration = self.cycle_count * single_cycle_duration
+        current_cycle_start = single_cycle_duration * (self.current_cycle_index - 1)
+    
+        current_seconds = self.current_timestamp % 3600
+        delta = (current_seconds - current_cycle_start) % full_pattern_duration
+
+        return delta < 0 or delta >= self.run_time
 
     def cancel_all_orders(self):
         """Cancels all active orders on the exchange and logs the pre-transmission timestamp and status."""
@@ -183,6 +214,9 @@ class LatencyTest(ScriptStrategyBase):
         if not self.order_filled:
             self.save_to_csv(self.timestamp_now, event.order_id, OrderState.EXECUTED.name)
             self.order_filled = True
+        msg = (f"fill {event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
+               f"at {round(event.price, 8)}")
+        self.notify_hb_app_with_timestamp(msg)
 
     def save_to_csv(self, timestamp, order_id, status):
         """Appends the provided data to the CSV file. If the file doesn't exist, it creates one."""
@@ -195,3 +229,4 @@ class LatencyTest(ScriptStrategyBase):
                 writer.writeheader()
 
             writer.writerow({'Timestamp': timestamp, 'Order_ID': order_id, 'Status': status})
+
