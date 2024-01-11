@@ -92,3 +92,8 @@ coverage.xml
 # External SDK files
 /**/.chain_cookie
 /**/.injective_cookie
+
+# data files
+/scripts/trades/
+/scripts/data/
+/scripts/crypto_data/
