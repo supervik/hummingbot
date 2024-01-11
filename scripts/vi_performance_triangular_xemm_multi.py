@@ -6,7 +6,8 @@ import pandas as pd
 
 # Load the CSV file into a pandas DataFrame
 directory = 'trades'
-filename = 'trades_vi_triangular_xemm_ETH_USDT_ku.csv'
+filename = 'trades_vi_triangular_xemm_BTC_USDC_USDT_ku.csv'
+fee = 0.08
 ignore_asset = "KCS"
 # df = pd.read_csv('trades_triangular_xemm_mul.csv')
 df = pd.read_csv(f'{directory}/{filename}')
@@ -75,7 +76,7 @@ def calculate_performance(group):
         performance = 100 * (buy_price / sell_price - 1)
 
     # Subtract fee from performance
-    performance = performance - 0.24
+    performance = performance - fee * 3
 
     # calculate the traded amount in quote currency
     quote_amount = group.iloc[0]['amount'] * group.iloc[0]['average_price']
@@ -107,7 +108,8 @@ df_performance = df_sorted.groupby('trading_round').apply(calculate_performance)
 
 # Print dataframe
 print(df_performance.tail(20))
-
+print(f"Total performance = {round(df_performance['performance'].sum(), 2)}%")
+print(f"Total performance quote = {df_performance['performance_quote'].sum()}")
 # Save the DataFrame to an Excel file
 df_performance.to_excel(f'{directory}/performance_{filename}.xlsx', index=False)
 
