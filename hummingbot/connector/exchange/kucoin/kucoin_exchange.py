@@ -221,12 +221,14 @@ class KucoinExchange(ExchangePyBase):
         This implementation specific function is called by _cancel, and returns True if successful
         """
         exchange_order_id = await tracked_order.get_exchange_order_id()
+        params = {"symbol": tracked_order.trading_pair}
         cancel_result = await self._api_delete(
             f"{CONSTANTS.ORDERS_PATH_URL}/{exchange_order_id}",
+            params=params,
             is_auth_required=True,
             limit_id=CONSTANTS.DELETE_ORDER_LIMIT_ID
         )
-        if tracked_order.exchange_order_id in cancel_result["data"].get("cancelledOrderIds", []):
+        if tracked_order.exchange_order_id in cancel_result["data"].get("orderId", []):
             return True
         return False
 
@@ -317,7 +319,7 @@ class KucoinExchange(ExchangePyBase):
 
         response = await self._api_get(
             path_url=CONSTANTS.ACCOUNTS_PATH_URL,
-            params={"type": "trade"},
+            params={"type": "trade_hf"},
             is_auth_required=True)
 
         if response:
@@ -477,13 +479,15 @@ class KucoinExchange(ExchangePyBase):
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         exchange_order_id = await tracked_order.get_exchange_order_id()
+        params = {"symbol": tracked_order.trading_pair}
         updated_order_data = await self._api_get(
             path_url=f"{CONSTANTS.ORDERS_PATH_URL}/{exchange_order_id}",
             is_auth_required=True,
+            params=params,
             limit_id=CONSTANTS.GET_ORDER_LIMIT_ID)
 
         ordered_canceled = updated_order_data["data"]["cancelExist"]
-        is_active = updated_order_data["data"]["isActive"]
+        is_active = updated_order_data["data"]["active"]
         op_type = updated_order_data["data"]["opType"]
 
         new_state = tracked_order.current_state
