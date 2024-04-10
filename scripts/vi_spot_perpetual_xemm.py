@@ -254,7 +254,7 @@ class SpotPerpetualXEMM(ScriptStrategyBase):
         self.taker_buy_hedging_price = self.taker_connector.get_price_for_volume(self.pair, True,
                                                                                  self.order_amount_in_base).result_price
         if self.add_safety_mid_prices_dif_for_hedge:
-            mid_taker_price = (self.taker_sell_hedging_price + self.taker_sell_hedging_price) / 2
+            mid_taker_price = (self.taker_buy_hedging_price + self.taker_sell_hedging_price) / 2
             mid_maker_price = self.maker_connector.get_mid_price(self.pair)
 
             mid_dif = mid_taker_price - mid_maker_price
