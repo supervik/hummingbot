@@ -21,25 +21,27 @@ class HedgePerpetual(ScriptStrategyBase):
     The script also works in the opposite direction to close the position and sell the asset on spot market
     """
     # Config params
-    maker_connector_name: str = "gate_io"
-    taker_connector_name: str = "gate_io_perpetual"
-    maker_pair: str = "IGU-USDT"
-    taker_pair: str = "IGU-USDT"
-    is_maker_spot = True
-    open_hedge = False
+    maker_connector_name: str = "gate_io_perpetual"
+    taker_connector_name: str = "gate_io"
+    maker_pair: str = "ETH-USDT"
+    taker_pair: str = "ETH-USDT"
+    buy_on_spot = False
 
-    max_order_amount = Decimal("100")
-    total_amount = Decimal("100")
-    kill_switch_balance = Decimal("100")
+    max_order_amount = Decimal("0.01")
+    total_amount = Decimal("0.01")
+    kill_switch_balance = Decimal("0")
     processed_amount = Decimal("0")
     processed_amount_quote = Decimal("0")
 
+    place_at_best_price = True
     min_spread_bps = 100
     spread_bps = 200
     max_order_age = 120
 
     slippage_buffer_spread_bps = 100
     leverage = Decimal("20")
+    order_type_maker = OrderType.LIMIT_MAKER
+    add_price_shift = False
 
     # class parameters
     status = "NOT_INIT"
@@ -49,7 +51,9 @@ class HedgePerpetual(ScriptStrategyBase):
     buy_order_placed = False
     sell_order_placed = False
     buy_on_maker = False
+    is_maker_spot = False
     filled_event_buffer = []
+    sent_event_buffer = []
 
     markets = {maker_connector_name: {maker_pair},
                taker_connector_name: {taker_pair}}
@@ -76,7 +80,7 @@ class HedgePerpetual(ScriptStrategyBase):
 
         if self.check_kill_switch_balance():
             return
-        
+
         self.calculate_maker_order_amount()
 
         self.calculate_taker_hedging_price()
@@ -86,11 +90,20 @@ class HedgePerpetual(ScriptStrategyBase):
         self.place_maker_orders()
 
     def init_strategy(self):
-        self.buy_on_maker = False if self.is_maker_spot ^ self.open_hedge else True
+        self.is_maker_spot = False if "perpetual" in self.maker_connector_name else True
+        self.buy_on_maker = False if self.is_maker_spot ^ self.buy_on_spot else True
+        spot_order = "BUY" if self.buy_on_spot else "SELL"
+        perp_order = "SHORT" if self.buy_on_spot else "LONG"
+        base_asset, quote_asset = self.maker_pair.split("-")
+        self.notify_hb_app_with_timestamp(f"Strategy started! \n\n"
+                                          f"It will {spot_order} {self.total_amount}{base_asset} "
+                                          f"on spot and {perp_order} the same amount on perpetuals.\n"
+                                          f"Maker connector is {self.maker_connector_name} \n"
+                                          f"Taker connector is {self.taker_connector_name} \n")
         self.status = "ACTIVE"
 
     def check_kill_switch_balance(self):
-        if self.buy_on_maker:
+        if self.buy_on_spot:
             base_asset, quote_asset = self.maker_pair.split("-")
             base_amount = self.maker_connector.get_balance(base_asset)
             if base_amount >= self.kill_switch_balance:
@@ -111,8 +124,9 @@ class HedgePerpetual(ScriptStrategyBase):
         if quantized_amount == Decimal("0"):
             final_price = round(self.processed_amount_quote / self.processed_amount, 8) if self.processed_amount else -1
             self.logger().info(f"Left amount {self.maker_order_amount} is less than minimum threshold. Stop the bot")
-            self.logger().info(f"Total amount processed = {self.processed_amount}.  Amount_quote = {self.processed_amount_quote} "
-                               f"Final price = {final_price}")
+            self.logger().info(
+                f"Total amount processed = {self.processed_amount}.  Amount_quote = {self.processed_amount_quote} "
+                f"Final price = {final_price}")
             self.status = "NOT_ACTIVE"
 
     def calculate_taker_hedging_price(self):
@@ -120,17 +134,14 @@ class HedgePerpetual(ScriptStrategyBase):
                                                                                   self.maker_order_amount).result_price
         self.taker_buy_hedging_price = self.taker_connector.get_price_for_volume(self.taker_pair, True,
                                                                                  self.maker_order_amount).result_price
-        mid_maker_price = self.maker_connector.get_mid_price(self.maker_pair)
-        mid_taker_price = (self.taker_sell_hedging_price + self.taker_buy_hedging_price) / 2
-        mid_dif = mid_taker_price - mid_maker_price
-        # self.logger().info(
-        #     f"mid_maker_price = {mid_maker_price} mid_taker_price = {mid_taker_price}, mid_dif = {mid_dif}, "
-        #     f"self.taker_sell_hedging_price = {self.taker_sell_hedging_price}")
-        if mid_dif > 0 and self.open_hedge and self.buy_on_maker:
-            self.taker_sell_hedging_price -= mid_dif
-            # self.logger().info(f"Shifted self.taker_sell_hedging_price = {self.taker_sell_hedging_price}")
-        if mid_dif < 0 and self.open_hedge and not self.buy_on_maker:
-            self.taker_buy_hedging_price += abs(mid_dif)
+        if self.add_price_shift:
+            mid_maker_price = self.maker_connector.get_mid_price(self.maker_pair)
+            mid_taker_price = (self.taker_sell_hedging_price + self.taker_buy_hedging_price) / 2
+            mid_dif = mid_taker_price - mid_maker_price
+            if mid_dif > 0 and self.buy_on_spot and self.buy_on_maker:
+                self.taker_sell_hedging_price -= mid_dif
+            if mid_dif < 0 and self.buy_on_spot and not self.buy_on_maker:
+                self.taker_buy_hedging_price += abs(mid_dif)
 
     def check_existing_orders_for_cancellation(self):
         self.buy_order_placed = False
@@ -139,16 +150,26 @@ class HedgePerpetual(ScriptStrategyBase):
             cancel_timestamp = order.creation_timestamp / 1000000 + self.max_order_age
             if order.is_buy:
                 self.buy_order_placed = True
-                buy_cancel_threshold = self.taker_sell_hedging_price * Decimal(1 - self.min_spread_bps / 10000)
-                if order.price > buy_cancel_threshold or cancel_timestamp < self.current_timestamp:
-                    self.logger().info(f"Cancelling buy order: {order.client_order_id}")
+                if cancel_timestamp < self.current_timestamp:
+                    self.logger().info(f"Time is over. Cancel order: {order.client_order_id}")
                     self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
+                    return
+                if not self.place_at_best_price:
+                    buy_cancel_threshold = self.taker_sell_hedging_price * Decimal(1 - self.min_spread_bps / 10000)
+                    if order.price > buy_cancel_threshold:
+                        self.logger().info(f"The threshold reached. Cancel buy order: {order.client_order_id}")
+                        self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
             else:
                 self.sell_order_placed = True
-                sell_cancel_threshold = self.taker_buy_hedging_price * Decimal(1 + self.min_spread_bps / 10000)
-                if order.price < sell_cancel_threshold or cancel_timestamp < self.current_timestamp:
-                    self.logger().info(f"Cancelling sell order: {order.client_order_id}")
+                if cancel_timestamp < self.current_timestamp:
+                    self.logger().info(f"Time is over. Cancel order: {order.client_order_id}")
                     self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
+                    return
+                if not self.place_at_best_price:
+                    sell_cancel_threshold = self.taker_buy_hedging_price * Decimal(1 + self.min_spread_bps / 10000)
+                    if order.price < sell_cancel_threshold or cancel_timestamp < self.current_timestamp:
+                        self.logger().info(f"The threshold reached. Cancel sell order: {order.client_order_id}")
+                        self.cancel(self.maker_connector_name, order.trading_pair, order.client_order_id)
 
     def place_maker_orders(self):
         if self.buy_order_placed or self.sell_order_placed:
@@ -156,19 +177,25 @@ class HedgePerpetual(ScriptStrategyBase):
 
         if self.buy_on_maker:
             if not self.buy_order_placed:
-                maker_price = self.taker_sell_hedging_price * Decimal(1 - self.spread_bps / 10000)
+                if self.place_at_best_price:
+                    maker_price = self.maker_connector.get_price(self.maker_pair, False)
+                else:
+                    maker_price = self.taker_sell_hedging_price * Decimal(1 - self.spread_bps / 10000)
                 maker_side = TradeType.BUY
         else:
             if not self.sell_order_placed:
-                maker_price = self.taker_buy_hedging_price * Decimal(1 + self.spread_bps / 10000)
+                if self.place_at_best_price:
+                    maker_price = self.maker_connector.get_price(self.maker_pair, True)
+                else:
+                    maker_price = self.taker_buy_hedging_price * Decimal(1 + self.spread_bps / 10000)
                 maker_side = TradeType.SELL
 
         if self.is_maker_spot:
-            maker_order = OrderCandidate(trading_pair=self.maker_pair, is_maker=True, order_type=OrderType.LIMIT,
+            maker_order = OrderCandidate(trading_pair=self.maker_pair, is_maker=True, order_type=self.order_type_maker,
                                          order_side=maker_side, amount=self.maker_order_amount, price=maker_price)
         else:
             maker_order = PerpetualOrderCandidate(trading_pair=self.maker_pair, is_maker=True,
-                                                  order_type=OrderType.LIMIT, order_side=maker_side,
+                                                  order_type=self.order_type_maker, order_side=maker_side,
                                                   amount=self.maker_order_amount, price=maker_price,
                                                   leverage=self.leverage)
 
@@ -178,11 +205,12 @@ class HedgePerpetual(ScriptStrategyBase):
 
     def send_order_to_exchange(self, candidate, connector_name):
         if candidate.order_side == TradeType.SELL:
-            self.sell(connector_name, candidate.trading_pair, candidate.amount, candidate.order_type,
-                      candidate.price, PositionAction.OPEN)
+            order_id = self.sell(connector_name, candidate.trading_pair, candidate.amount, candidate.order_type,
+                                 candidate.price, PositionAction.OPEN)
         else:
-            self.buy(connector_name, candidate.trading_pair, candidate.amount, candidate.order_type,
-                     candidate.price, PositionAction.OPEN)
+            order_id = self.buy(connector_name, candidate.trading_pair, candidate.amount, candidate.order_type,
+                                candidate.price, PositionAction.OPEN)
+        return order_id
 
     def is_active_maker_order(self, event: OrderFilledEvent):
         """
@@ -214,7 +242,7 @@ class HedgePerpetual(ScriptStrategyBase):
         amount_total = Decimal("0")
         for event in self.filled_event_buffer:
             amount_total += event.amount
-    
+
         self.logger().info(f"amount_total = {amount_total}")
         quantized_amount_total = self.taker_connector.quantize_order_amount(self.taker_pair, amount_total)
         if quantized_amount_total == Decimal("0"):
@@ -223,12 +251,14 @@ class HedgePerpetual(ScriptStrategyBase):
 
         if self.buy_on_maker:
             taker_side = TradeType.SELL
-            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, False, quantized_amount_total).result_price
+            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, False,
+                                                                    quantized_amount_total).result_price
             taker_price_with_slippage = taker_price * Decimal(1 - self.slippage_buffer_spread_bps / 10000)
             self.logger().info(f"Sending sell on taker with price {taker_price}")
         else:
             taker_side = TradeType.BUY
-            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, True, quantized_amount_total).result_price
+            taker_price = self.taker_connector.get_price_for_volume(self.maker_pair, True,
+                                                                    quantized_amount_total).result_price
             taker_price_with_slippage = taker_price * Decimal(1 + self.slippage_buffer_spread_bps / 10000)
             self.logger().info(f"Sending buy on taker with price {taker_price}")
 
@@ -246,9 +276,10 @@ class HedgePerpetual(ScriptStrategyBase):
         taker_candidate_adjusted = self.taker_connector.budget_checker.adjust_candidate(taker_candidate,
                                                                                         all_or_none=True)
         if taker_candidate_adjusted.amount != Decimal("0"):
-            self.logger().info(f"Delete all events from filled_event_buffer")
-            self.filled_event_buffer = []
-            self.send_order_to_exchange(candidate=taker_candidate_adjusted, connector_name=self.taker_connector_name)
+            order_id = self.send_order_to_exchange(candidate=taker_candidate_adjusted, connector_name=self.taker_connector_name)
+            if order_id:
+                self.logger().info(f"Order {order_id} created. Delete all events from filled_event_buffer")
+                self.filled_event_buffer = []
             self.logger().info(f"send_order_to_exchange. Candidate adjusted {taker_candidate_adjusted}")
 
         else:
