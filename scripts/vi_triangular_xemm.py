@@ -93,6 +93,8 @@ class TriangularXEMM(ScriptStrategyBase):
     kill_switch_check_timestamp = 0
     kill_switch_counter = 0
     kill_switch_max_balance = Decimal("0")
+    place_maker_delay_timestamp = 0
+    place_maker_delay = 5
 
     if fee_tracking_enabled:
         markets = {connector_name: {maker_pair, taker_pair_1, taker_pair_2, fee_pair}}
@@ -174,6 +176,10 @@ class TriangularXEMM(ScriptStrategyBase):
 
         if self.check_and_cancel_maker_orders():
             return
+
+        if self.current_timestamp < self.place_maker_delay_timestamp:
+            return
+
         self.place_maker_orders()
 
     def init_strategy(self):
@@ -519,6 +525,10 @@ class TriangularXEMM(ScriptStrategyBase):
                 break
 
         return Decimal(cumulative_base_amount)
+
+    def did_fail_order(self, event: MarketOrderFailureEvent):
+        self.log_with_clock(logging.INFO, f"Order {event.order_id} was failed to be placed")
+        self.place_maker_delay_timestamp = self.current_timestamp + self.place_maker_delay
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         if event.trading_pair == self.maker_pair:
