@@ -8,7 +8,8 @@ from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptS
 
 class BalanceMonitor(ScriptStrategyBase):
     """
-    The script monitor balances and rebalance assets if there balances doesn't match
+    The script monitor balances and rebalance assets if there balances doesn't match.
+    Used together with the triangular XEMM
     """
     # Config params
     connector_name: str = "kucoin"

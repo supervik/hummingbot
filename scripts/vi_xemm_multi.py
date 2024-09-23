@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pandas as pd
 
+from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
@@ -26,8 +27,8 @@ class XEMMVik(ScriptStrategyBase):
                      "XLM-BTC", "NEO-BTC", "ZEC-BTC", "DOGE-BTC", "XEM-BTC", "LRC-BTC", "EOS-BTC", "DOT-BTC",
                      "XTZ-BTC", "QTUM-BTC", "ATOM-BTC", "VRA-BTC", "ZRX-BTC"}
 
-    order_amount_in_quote = Decimal("1.5")
-    min_quote_balance = Decimal("400")  # bot places only sell orders if the total balance is less than defined here
+    order_amount_in_quote = {"USDT": Decimal("1.5"), "BTC": Decimal("0.0001"), "ETH": Decimal("0.001")}
+    min_quote_balance = {"USDT": Decimal("100"), "BTC": Decimal("0.001"), "ETH": Decimal("0.01")}  # bot places only sell orders if the total balance is less than defined here
     spread_bps = 100  # bot places maker orders at this spread to taker price
     min_spread_bps = 60  # bot refreshes order if spread is lower than min-spread
     max_spread_bps = 120  # bot refreshes order if spread is higher than max-spread
@@ -46,7 +47,7 @@ class XEMMVik(ScriptStrategyBase):
     taker_sell_hedging_price = 0
     buy_order_amount = 0
     sell_order_amount = 0
-    order_delay = 15
+    order_delay = 10
     next_maker_order_timestamp = 0
 
     @property
@@ -66,14 +67,15 @@ class XEMMVik(ScriptStrategyBase):
 
             self.calculate_hedging_price()
 
-            self.check_existing_orders_for_cancellation()
+            if self.check_existing_orders_for_cancellation():
+                continue
 
             self.check_open_maker_orders_conditions()
 
             # self.check_mid_price_position()
 
             if self.current_timestamp < self.next_maker_order_timestamp:
-                return
+                continue
 
             self.place_maker_orders()
 
@@ -85,10 +87,14 @@ class XEMMVik(ScriptStrategyBase):
         base_asset, quote_asset = self.pair.split("-")
         base_amount = self.maker_connector.get_balance(base_asset)
         base_amount_quantized = self.maker_connector.quantize_order_amount(self.pair, base_amount)
-
         mid_price = self.maker_connector.get_mid_price(self.pair)
+
         self.sell_order_amount = base_amount_quantized
-        self.buy_order_amount = self.order_amount_in_quote / mid_price
+        try:
+            self.buy_order_amount = self.order_amount_in_quote[quote_asset] / mid_price
+        except KeyError:
+            self.logger().error(f"Order amount is nod defined for quote {quote_asset}")
+            HummingbotApplication.main_application().stop()
 
     def calculate_hedging_price(self):
         """
@@ -123,8 +129,12 @@ class XEMMVik(ScriptStrategyBase):
         base_asset, quote_asset = self.pair.split("-")
         quote_balance = self.maker_connector.get_balance(quote_asset)
 
-        if quote_balance < self.min_quote_balance:
-            self.open_buy = False
+        try:
+            if quote_balance < self.min_quote_balance[quote_asset]:
+                self.open_buy = False
+        except KeyError:
+            self.logger().error(f"Minimum quote balance is not defined for quote {quote_asset}")
+            HummingbotApplication.main_application().stop()
 
     # def check_mid_price_position(self):
     #     """
@@ -155,6 +165,7 @@ class XEMMVik(ScriptStrategyBase):
                             or cancel_timestamp < self.current_timestamp:
                         self.logger().info(f"Cancelling buy order {order.trading_pair}: {order.client_order_id}")
                         self.cancel(self.maker_exchange, order.trading_pair, order.client_order_id)
+                        return True
                 else:
                     self.sell_order_placed = True
                     sell_cancel_threshold_up = self.taker_buy_hedging_price * Decimal(1 + self.max_spread_bps / 10000)
@@ -163,6 +174,8 @@ class XEMMVik(ScriptStrategyBase):
                             or cancel_timestamp < self.current_timestamp:
                         self.logger().info(f"Cancelling sell order {order.trading_pair}: {order.client_order_id}")
                         self.cancel(self.maker_exchange, order.trading_pair, order.client_order_id)
+                        return True
+        return False
 
     def place_maker_orders(self):
         """
