@@ -9,8 +9,15 @@ import pandas as pd
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent, \
-    MarketOrderFailureEvent, BuyOrderCompletedEvent, SellOrderCompletedEvent, OrderCancelledEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    BuyOrderCreatedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderFilledEvent,
+    SellOrderCompletedEvent,
+    SellOrderCreatedEvent,
+)
 from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
 
 
@@ -30,24 +37,24 @@ class TriangularXEMM(ScriptStrategyBase):
     The script has kill_switch and fee asset check and rebalance
     """
     # Config params
-    connector_name: str = "kucoin"
-    maker_pair: str = "ETH-USDC"
-    taker_pair_1: str = "ETH-USDT"
-    taker_pair_2: str = "USDC-USDT"
+    connector_name: str = "htx"
+    maker_pair: str = "TRX-BTC"
+    taker_pair_1: str = "TRX-USDT"
+    taker_pair_2: str = "BTC-USDT"
 
-    min_spread: Decimal = Decimal("0.5")
-    max_spread: Decimal = Decimal("1")
+    min_spread: Decimal = Decimal("1")
+    max_spread: Decimal = Decimal("2")
 
-    order_amount: Decimal = Decimal("0.4")
-    min_maker_order_amount = Decimal("0.2")
-    min_taker_order_amount = Decimal("0.002")
+    order_amount: Decimal = Decimal("600")
+    min_maker_order_amount = Decimal("400")
+    min_taker_order_amount = Decimal("100")
     leftover_bid_pct = Decimal("0")
     leftover_ask_pct = Decimal("0")
 
     trigger_arbitrage_on_base_change = True
-    set_target_from_config = False
-    target_base_amount = Decimal("0.01")
-    target_quote_amount = Decimal("20")
+    set_target_from_config = True
+    target_base_amount = Decimal("600")  # Define here the target balance of the base asset
+    target_quote_amount = Decimal("0.0015")  # Define here the target balance of the quote asset
 
     place_bid = True
     place_ask = True
@@ -68,7 +75,7 @@ class TriangularXEMM(ScriptStrategyBase):
     order_delay = 15
     slippage_buffer = Decimal("1")
     slippage_buffer_third_asset = Decimal("1.2")
-    taker_order_type = OrderType.MARKET
+    taker_order_type = OrderType.LIMIT
     test_latency = False
     max_order_age = 1800
 

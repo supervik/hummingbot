@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 
 from hummingbot.connector.utils import split_hb_trading_pair
-from hummingbot.core.data_type.common import TradeType, PositionAction, PositionSide
+from hummingbot.core.data_type.common import PositionAction, PositionSide, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderFilledEvent, SellOrderCreatedEvent
 from hummingbot.strategy.script_strategy_base import Decimal, OrderType, ScriptStrategyBase
