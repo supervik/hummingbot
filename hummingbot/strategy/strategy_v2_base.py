@@ -197,6 +197,7 @@ class StrategyV2Base(ScriptStrategyBase):
         self.executor_orchestrator = ExecutorOrchestrator(strategy=self)
 
         self.executors_info: Dict[str, List[ExecutorInfo]] = {}
+        self.positions_held: Dict[str, List] = {}
 
         # Create a queue to listen to actions from the controllers
         self.actions_queue = asyncio.Queue()
@@ -264,8 +265,10 @@ class StrategyV2Base(ScriptStrategyBase):
         """
         try:
             self.executors_info = self.executor_orchestrator.get_executors_report()
+            self.positions_held = self.executor_orchestrator.get_positions_report()
             for controllers in self.controllers.values():
                 controllers.executors_info = self.executors_info.get(controllers.config.id, [])
+                controllers.positions_held = self.positions_held.get(controllers.config.id, [])
         except Exception as e:
             self.logger().error(f"Error updating executors info: {e}", exc_info=True)
 
@@ -282,7 +285,7 @@ class StrategyV2Base(ScriptStrategyBase):
         for i in range(self.max_executors_close_attempts):
             if all([executor.is_done for executor in self.get_all_executors()]):
                 continue
-            await asyncio.sleep(1)
+            await asyncio.sleep(5.0)
         self.executor_orchestrator.store_all_executors()
 
     def on_tick(self):
@@ -377,14 +380,14 @@ class StrategyV2Base(ScriptStrategyBase):
             extra_info.append(f"\n\nController: {controller_id}")
             # Append controller market data metrics
             extra_info.extend(controller.to_format_status())
-            executors_list = self.get_executors_by_controller(controller_id)
-            if len(executors_list) == 0:
-                extra_info.append("No executors found.")
-            else:
-                # In memory executors info
-                executors_df = self.executors_info_to_df(executors_list)
-                executors_df["age"] = self.current_timestamp - executors_df["timestamp"]
-                extra_info.extend([format_df_for_printout(executors_df[columns_to_show], table_format="psql")])
+            # executors_list = self.get_executors_by_controller(controller_id)
+            # if len(executors_list) == 0:
+            #     extra_info.append("No executors found.")
+            # else:
+            #     # In memory executors info
+            #     executors_df = self.executors_info_to_df(executors_list)
+            #     executors_df["age"] = self.current_timestamp - executors_df["timestamp"]
+            #     extra_info.extend([format_df_for_printout(executors_df[columns_to_show], table_format="psql")])
 
             # Generate performance report for each controller
             performance_report = self.executor_orchestrator.generate_performance_report(controller_id)
@@ -395,6 +398,32 @@ class StrategyV2Base(ScriptStrategyBase):
                 f"--> Global PNL (Quote): {performance_report.global_pnl_quote:.2f} | Global PNL (%): {performance_report.global_pnl_pct:.2f}%",
                 f"Total Volume Traded: {performance_report.volume_traded:.2f}"
             ]
+
+            # Add position summary if available
+            if hasattr(performance_report, "positions_summary") and performance_report.positions_summary:
+                controller_performance_info.append("\nPositions Held Summary:")
+                controller_performance_info.append("-" * 120)
+                controller_performance_info.append(
+                    f"{'Connector':<15} {'Trading Pair':<12} | "
+                    f"{'Volume':<12} | "
+                    f"{'Units':<10} | "
+                    f"{'Value (USD)':<16} | "
+                    f"{'BEP':<16} | "
+                    f"{'Unreal. PNL':<12} | "
+                    f"{'Fees':<10}"
+                )
+                controller_performance_info.append("-" * 120)
+                for pos in performance_report.positions_summary:
+                    controller_performance_info.append(
+                        f"{pos.connector_name:<15} {pos.trading_pair:<12} | "
+                        f"${pos.volume_traded_quote:>11.2f} | "
+                        f"{pos.amount:>10.4f} | "
+                        f"${pos.amount * pos.breakeven_price:>16.2f} | "
+                        f"{pos.breakeven_price:>16.6f} | "
+                        f"${pos.unrealized_pnl_quote:>+11.2f} | "
+                        f"${pos.cum_fees_quote:>9.2f}"
+                    )
+                controller_performance_info.append("-" * 120)
 
             # Append close type counts
             if performance_report.close_type_counts:
