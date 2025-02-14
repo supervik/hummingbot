@@ -18,7 +18,7 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 
 
 class XEMMExplorerControllerConfig(ControllerConfigBase):
-    controller_name: str = "xemm_explorer_controller"
+    controller_name: str = "xemm_explorer"
     candles_config: List[CandlesConfig] = []
     maker_exchange: str = Field(
         default="kucoin",
