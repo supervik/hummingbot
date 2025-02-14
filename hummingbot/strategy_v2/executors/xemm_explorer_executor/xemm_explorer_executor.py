@@ -51,7 +51,7 @@ class XEMMExplorerExecutor(ExecutorBase):
         self._max_retries = max_retries
 
     # 1. Initialization & Startup Methods
-    def on_start(self):
+    async def on_start(self):
         """
         Initializes the executor. If liquidate_base_assets is configured,
         liquidates assets and stops. Otherwise proceeds with normal startup.
@@ -61,7 +61,7 @@ class XEMMExplorerExecutor(ExecutorBase):
             self.close_type = CloseType.EARLY_STOP
             self.stop()
         else:
-            super().on_start()
+            await super().on_start()
     
     def liquidate_base_assets(self):
         """
@@ -89,7 +89,7 @@ class XEMMExplorerExecutor(ExecutorBase):
         self._status = RunnableStatus.SHUTTING_DOWN
         self.stop()
 
-    def validate_sufficient_balance(self):
+    async def validate_sufficient_balance(self):
         """
         Validates if there is sufficient balance to execute trades.
         Stops the executor if balance is insufficient.
