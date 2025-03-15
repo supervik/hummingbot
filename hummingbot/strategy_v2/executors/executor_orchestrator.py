@@ -25,6 +25,8 @@ from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecut
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.xemm_explorer_executor import XEMMExplorerExecutor
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.data_types import XEMMExplorerExecutorConfig
+from hummingbot.strategy_v2.executors.spot_perp_executor.data_types import SpotPerpExecutorConfig
+from hummingbot.strategy_v2.executors.spot_perp_executor.spot_perp_executor import SpotPerpExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
     ExecutorAction,
@@ -244,6 +246,8 @@ class ExecutorOrchestrator:
             executor = XEMMExecutor(self.strategy, executor_config, self.executors_update_interval)
         elif isinstance(executor_config, XEMMExplorerExecutorConfig):
             executor = XEMMExplorerExecutor(self.strategy, executor_config, self.executors_update_interval)
+        elif isinstance(executor_config, SpotPerpExecutorConfig):
+            executor = SpotPerpExecutor(self.strategy, executor_config, self.executors_update_interval)
         else:
             raise ValueError("Unsupported executor config type")
 

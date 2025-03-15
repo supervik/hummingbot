@@ -11,6 +11,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.data_types import XEMMExplorerExecutorConfig
+from hummingbot.strategy_v2.executors.spot_perp_executor.data_types import SpotPerpExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 
@@ -22,7 +23,7 @@ class ExecutorInfo(BaseModel):
     close_timestamp: Optional[float]
     close_type: Optional[CloseType]
     status: RunnableStatus
-    config: Union[PositionExecutorConfig, XEMMExecutorConfig, XEMMExplorerExecutorConfig, ArbitrageExecutorConfig, DCAExecutorConfig, TWAPExecutorConfig, ExecutorConfigBase]
+    config: Union[PositionExecutorConfig, XEMMExecutorConfig, XEMMExplorerExecutorConfig, ArbitrageExecutorConfig, DCAExecutorConfig, TWAPExecutorConfig, SpotPerpExecutorConfig, ExecutorConfigBase]
     net_pnl_pct: Decimal
     net_pnl_quote: Decimal
     cum_fees_quote: Decimal
