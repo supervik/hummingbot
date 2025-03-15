@@ -54,22 +54,22 @@ class VikV2WithControllers(StrategyV2Base):
     def on_tick(self):
         super().on_tick()
 
-    @staticmethod
-    def executors_info_to_df(executors_info: List[ExecutorInfo]) -> pd.DataFrame:
-        """
-        Convert a list of executor handler info to a dataframe.
-        """
-        df = pd.DataFrame([ei.to_dict() for ei in executors_info])
-        # Convert the enum values to integers
-        df['status'] = df['status'].apply(lambda x: x.value)
+    # @staticmethod
+    # def executors_info_to_df(executors_info: List[ExecutorInfo]) -> pd.DataFrame:
+    #     """
+    #     Convert a list of executor handler info to a dataframe.
+    #     """
+    #     df = pd.DataFrame([ei.to_dict() for ei in executors_info])
+    #     # Convert the enum values to integers
+    #     df['status'] = df['status'].apply(lambda x: x.value)
 
-        # Sort the DataFrame
-        df.sort_values(by='status', ascending=True, inplace=True)
+    #     # Sort the DataFrame
+    #     df.sort_values(by='status', ascending=True, inplace=True)
 
-        # Convert back to string representation without enum prefix
-        df['status'] = df['status'].apply(lambda x: RunnableStatus(x).name)
-        df['close_type'] = df['close_type'].apply(lambda x: CloseType(x).name if x is not None else None)
-        return df
+    #     # Convert back to string representation without enum prefix
+    #     df['status'] = df['status'].apply(lambda x: RunnableStatus(x).name)
+    #     df['close_type'] = df['close_type'].apply(lambda x: CloseType(x).name if x is not None else None)
+    #     return df
         
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         return []

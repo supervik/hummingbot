@@ -23,6 +23,8 @@ from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExe
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.xemm_explorer_executor import XEMMExplorerExecutor
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.data_types import XEMMExplorerExecutorConfig
+from hummingbot.strategy_v2.executors.spot_perp_executor.data_types import SpotPerpExecutorConfig
+from hummingbot.strategy_v2.executors.spot_perp_executor.spot_perp_executor import SpotPerpExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
     ExecutorAction,
@@ -147,6 +149,7 @@ class ExecutorOrchestrator:
         "twap_executor": TWAPExecutor,
         "xemm_executor": XEMMExecutor,
         "xemm_explorer_executor": XEMMExplorerExecutor,
+        "spot_perp_executor": SpotPerpExecutor,
         "order_executor": OrderExecutor,
     }
 
