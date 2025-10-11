@@ -86,8 +86,8 @@ class TriangularXEMM(ScriptStrategyBase):
     spread = 0
     assets = {}
 
-    has_open_bid = False
-    has_open_ask = False
+    open_maker_bid_id = None
+    open_maker_ask_id = None
     maker_order_filled = False
     taker1_order_filled = False
     taker2_order_filled = False
@@ -167,6 +167,7 @@ class TriangularXEMM(ScriptStrategyBase):
             self.log_with_clock(logging.INFO, "<< Hedging mode started! >>")
             taker_orders = self.get_taker_order_data(balance_diff_base, balance_diff_quote)
             self.place_taker_orders(taker_orders)
+            self.cancel_all_orders()
             return
 
         if self.maker_order_filled:
@@ -319,6 +320,8 @@ class TriangularXEMM(ScriptStrategyBase):
         self.maker_order_filled = False
         self.taker1_order_filled = False
         self.taker2_order_filled = False
+        self.open_maker_bid_id = None
+        self.open_maker_ask_id = None
 
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
@@ -352,7 +355,6 @@ class TriangularXEMM(ScriptStrategyBase):
     def place_taker_orders(self, taker_order):
         self.status = "HEDGE_MODE"
         self.last_order_timestamp = self.current_timestamp
-        self.cancel_all_orders()
 
         for i in range(2):
             amount = self.connector.quantize_order_amount(taker_order["pair"][i], taker_order["amount"][i])
@@ -381,7 +383,7 @@ class TriangularXEMM(ScriptStrategyBase):
             self.log_with_clock(logging.INFO, f"New taker candidate added to the list: {self.taker_candidates[-1]}")
 
     def place_maker_orders(self):
-        if not self.has_open_bid and self.place_bid:
+        if not self.open_maker_bid_id and self.place_bid:
             order_price = self.taker_sell_price * Decimal(1 - self.spread / 100)
             amount = self.get_order_amount_considering_third_asset_balance()
             buy_candidate = OrderCandidate(trading_pair=self.maker_pair,
@@ -390,9 +392,11 @@ class TriangularXEMM(ScriptStrategyBase):
                                            order_side=TradeType.BUY,
                                            amount=amount,
                                            price=order_price)
-            self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
+            maker_buy_result = self.adjust_and_place_order(candidate=buy_candidate, all_or_none=False)
+            if maker_buy_result:
+                self.open_maker_bid_id = maker_buy_result
 
-        if not self.has_open_ask and self.place_ask:
+        if not self.open_maker_ask_id and self.place_ask:
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
             amount = self.get_order_amount_considering_third_asset_balance()
             sell_candidate = OrderCandidate(
@@ -402,7 +406,9 @@ class TriangularXEMM(ScriptStrategyBase):
                 order_side=TradeType.SELL,
                 amount=amount,
                 price=order_price)
-            self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
+            maker_sell_result = self.adjust_and_place_order(candidate=sell_candidate, all_or_none=False)
+            if maker_sell_result:
+                self.open_maker_ask_id = maker_sell_result
 
     def get_order_amount_considering_third_asset_balance(self):
         third_asset = self.assets["taker_1_quote"]
@@ -436,8 +442,8 @@ class TriangularXEMM(ScriptStrategyBase):
             candidate_adjusted.amount *= Decimal("1") - leftover_pct / Decimal("100")
             candidate_adjusted.amount = self.connector.quantize_order_amount(candidate_adjusted.trading_pair, candidate_adjusted.amount)
 
-        self.place_order(candidate_adjusted)
-        return True
+        order_id = self.place_order(candidate_adjusted)
+        return order_id
 
     def place_order(self, candidate):
         time_before_order_sent = self.timestamp_now
@@ -453,6 +459,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
         status = OrderState.PENDING_CREATE if candidate.trading_pair == self.maker_pair else OrderState.PENDING_EXECUTE
         self.save_to_csv(time_before_order_sent, order_id, status.name)
+        return order_id
 
     def cancel_all_orders(self):
         for order in self.get_active_orders(self.connector_name):
@@ -486,12 +493,12 @@ class TriangularXEMM(ScriptStrategyBase):
         return final_price
 
     def check_and_cancel_maker_orders(self):
-        self.has_open_bid = False
-        self.has_open_ask = False
+        # self.has_open_bid = False
+        # self.has_open_ask = False
         for order in self.get_active_orders(connector_name=self.connector_name):
             cancel_timestamp = order.creation_timestamp / 1000000 + self.max_order_age
             if order.is_buy:
-                self.has_open_bid = True
+                # self.has_open_bid = True
                 upper_price = self.taker_sell_price * Decimal(1 - self.min_spread / 100)
                 lower_price = self.taker_sell_price * Decimal(1 - self.max_spread / 100)
                 if order.price > upper_price or order.price < lower_price or self.current_timestamp > cancel_timestamp:
@@ -499,7 +506,7 @@ class TriangularXEMM(ScriptStrategyBase):
                     self.cancel_order_by_id(self.connector_name, order.trading_pair, order.client_order_id)
                     return True
             else:
-                self.has_open_ask = True
+                # self.has_open_ask = True
                 upper_price = self.taker_buy_price * Decimal(1 + self.max_spread / 100)
                 lower_price = self.taker_buy_price * Decimal(1 + self.min_spread / 100)
                 if order.price > upper_price or order.price < lower_price or self.current_timestamp > cancel_timestamp:
@@ -536,6 +543,10 @@ class TriangularXEMM(ScriptStrategyBase):
     def did_fail_order(self, event: MarketOrderFailureEvent):
         self.log_with_clock(logging.INFO, f"Order {event.order_id} was failed to be placed")
         self.place_maker_delay_timestamp = self.current_timestamp + self.place_maker_delay
+        if event.order_id == self.open_maker_bid_id:
+            self.open_maker_bid_id = None
+        elif event.order_id == self.open_maker_ask_id:
+            self.open_maker_ask_id = None
 
     def did_create_buy_order(self, event: BuyOrderCreatedEvent):
         if event.trading_pair == self.maker_pair:
@@ -577,6 +588,13 @@ class TriangularXEMM(ScriptStrategyBase):
     def did_cancel_order(self, event: OrderCancelledEvent):
         """Logs the post-transmission timestamp when a confirmation of order cancelled is received."""
         self.save_to_csv(self.timestamp_now, event.order_id, OrderState.CANCELED.name)
+        self.log_with_clock(logging.INFO, f"Order {event.order_id} was cancelled. bid_order_id = {self.open_maker_bid_id} ask_order_id = {self.open_maker_ask_id}")
+        if event.order_id == self.open_maker_bid_id:
+            self.log_with_clock(logging.INFO, f"Maker bid order {event.order_id} was cancelled")
+            self.open_maker_bid_id = None
+        elif event.order_id == self.open_maker_ask_id:
+            self.log_with_clock(logging.INFO, f"Maker ask order {event.order_id} was cancelled")
+            self.open_maker_ask_id = None
 
     def check_and_remove_taker_candidates(self, filled_event, trade_type):
         candidates = self.taker_candidates.copy()
