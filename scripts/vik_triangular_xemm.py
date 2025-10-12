@@ -29,7 +29,6 @@ class OrderState(Enum):
     PENDING_EXECUTE = 4
     EXECUTED = 5
 
-
 class TriangularXEMM(ScriptStrategyBase):
     """
     The script that performs triangular XEMM on a single exchange.
@@ -71,6 +70,7 @@ class TriangularXEMM(ScriptStrategyBase):
     kill_switch_rate = Decimal("-3")
     kill_switch_check_interval = 60
     kill_switch_counter_limit = 5
+    kill_switch_arb_max_loss_pct = Decimal("-0.2")
 
     order_delay = 15
     slippage_buffer = Decimal("1")
@@ -91,6 +91,10 @@ class TriangularXEMM(ScriptStrategyBase):
     maker_order_filled = False
     taker1_order_filled = False
     taker2_order_filled = False
+    maker_filled_order_price = 0
+    taker_1_filled_order_price = 0
+    taker_2_filled_order_price = 0
+    maker_filled_order_side = None
     taker_candidates: list = []
     last_order_timestamp = 0
     maker_filled_timestamp = 0
@@ -313,15 +317,44 @@ class TriangularXEMM(ScriptStrategyBase):
             self.finalize_arbitrage()
 
     def finalize_arbitrage(self):
-        msg = f"--- Arbitrage round completed"
+        profit = self.calculate_arb_profit()
+        msg = f"--- Arbitrage round completed. Profit: {profit}%"
         self.notify_hb_app_with_timestamp(msg)
         self.log_with_clock(logging.WARNING, msg)
+
+        if profit < self.kill_switch_arb_max_loss_pct:
+            msg = f"Arbitrage profit is less than {self.kill_switch_arb_max_loss_pct}%. Stop trading"
+            self.log_with_clock(logging.WARNING, msg)
+            self.notify_hb_app_with_timestamp(msg)
+            self.status = "NOT_ACTIVE"
+            return
+
         self.status = "ACTIVE"
         self.maker_order_filled = False
         self.taker1_order_filled = False
         self.taker2_order_filled = False
         self.open_maker_bid_id = None
         self.open_maker_ask_id = None
+        self.maker_filled_order_price = 0
+        self.taker_1_filled_order_price = 0
+        self.taker_2_filled_order_price = 0
+
+    def calculate_arb_profit(self):
+        if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
+            open_price = self.maker_filled_order_price / self.taker_1_filled_order_price
+        else:
+            open_price = self.taker_1_filled_order_price / self.maker_filled_order_price
+
+        close_price = self.taker_2_filled_order_price
+        if self.maker_filled_order_side == TradeType.BUY:
+            buy_price = open_price
+            sell_price = close_price
+        else:
+            buy_price = close_price
+            sell_price = open_price
+
+        profit = Decimal("100") * (sell_price - buy_price) / buy_price 
+        return profit
 
     def get_target_balance_diff(self, asset, target_amount):
         current_balance = self.connector.get_balance(asset)
@@ -564,13 +597,17 @@ class TriangularXEMM(ScriptStrategyBase):
         if event.trading_pair == self.maker_pair:
             self.maker_order_filled = True
             self.maker_filled_timestamp = self.current_timestamp
+            self.maker_filled_order_price = event.price
+            self.maker_filled_order_side = event.trade_type
             if self.status != "HEDGE_MODE":
                 self.cancel_all_orders()
         else:
             if event.trading_pair == self.taker_pair_1:
                 self.taker1_order_filled = True
+                self.taker_1_filled_order_price = event.price
             if event.trading_pair == self.taker_pair_2:
                 self.taker2_order_filled = True
+                self.taker_2_filled_order_price = event.price
             self.check_and_remove_taker_candidates(event, event.trade_type)
         msg = (f"fill {event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.connector_name} "
                f"at {round(event.price, 5)}")
