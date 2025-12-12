@@ -1,11 +1,12 @@
 from decimal import Decimal
+from typing import Literal
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
 
 
 class XEMMExplorerExecutorConfig(ExecutorConfigBase):
-    type = "xemm_explorer_executor"
+    type: Literal["xemm_explorer_executor"] = "xemm_explorer_executor"
     maker_exchange: str
     taker_exchange: str
     trading_pair: str

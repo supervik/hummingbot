@@ -1,11 +1,12 @@
 from decimal import Decimal
+from typing import Literal
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
 
 
 class SpotPerpExecutorConfig(ExecutorConfigBase):
-    type = "spot_perp_executor"
+    type: Literal["spot_perp_executor"] = "spot_perp_executor"
     maker_exchange: str
     taker_exchange: str
     trading_pair: str
