@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import random
 import time
 from decimal import Decimal
 from enum import Enum
@@ -37,7 +38,7 @@ class OrderState(Enum):
 
 class TriangularXEMMConfig(BaseClientModel):
     script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
-    
+
     # ===== Exchange & Trading Pairs =====
     connector_name: str = Field("htx", client_data=ClientFieldData(
         prompt_on_new=True, prompt=lambda mi: "Exchange name"))
@@ -65,6 +66,8 @@ class TriangularXEMMConfig(BaseClientModel):
         prompt_on_new=False, prompt=lambda mi: "Leftover bid percentage"))
     leftover_ask_pct: Decimal = Field(Decimal("0"), client_data=ClientFieldData(
         prompt_on_new=False, prompt=lambda mi: "Leftover ask percentage"))
+    maker_order_size_variance_pct: Decimal = Field(Decimal("3"), client_data=ClientFieldData(
+        prompt_on_new=False, prompt=lambda mi: "Maker order size variance (%)"))
     
     # ===== Rebalancing Configuration =====
     trigger_arbitrage_on_base_change: bool = Field(True, client_data=ClientFieldData(
@@ -328,7 +331,7 @@ class TriangularXEMM(ScriptStrategyBase):
             if diff_pct < self.config.kill_switch_rate:
                 if self.kill_switch_counter > self.config.kill_switch_counter_limit:
                     msg = f"!!! Kill switch threshold reached. Stop trading!"
-                    self.cancel_all_orders()
+                    self.cancel_all_orders(cancel_maker_orders=False)
                     self.notify_hb_app_with_timestamp(msg)
                     self.log_with_clock(logging.WARNING, msg)
                     self.status = "NOT_ACTIVE"
@@ -376,7 +379,7 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def finalize_arbitrage(self):
         profit = self.calculate_arb_profit()
-        msg = f"--- Arbitrage round completed. Profit: {profit}%"
+        msg = f"--- Arbitrage round completed. Profit: {round(profit, 2)}%"
         self.notify_hb_app_with_timestamp(msg)
         self.log_with_clock(logging.WARNING, msg)
 
@@ -398,20 +401,30 @@ class TriangularXEMM(ScriptStrategyBase):
         self.taker_2_filled_order_price = 0
 
     def calculate_arb_profit(self):
+        """
+        Calculate arbitrage profit using Direct Flow Tracking.
+        Simulates a round-trip conversion through the triangle:
+        Start with 1 unit, execute the three trades, see what we end with.
+        """
+        amount = Decimal("1")
+        is_buy = self.maker_filled_order_side == TradeType.BUY
+        
+        # Trade 1: Maker
+        amount = amount / self.maker_filled_order_price if is_buy else amount * self.maker_filled_order_price
+        
+        # Trade 2: Taker1 (always opposite of maker)
+        amount = amount * self.taker_1_filled_order_price if is_buy else amount / self.taker_1_filled_order_price
+        
+        # Trade 3: Taker2 (direction depends on whether taker quotes match)
         if self.assets["taker_1_quote"] == self.assets["taker_2_quote"]:
-            open_price = self.maker_filled_order_price / self.taker_1_filled_order_price
+            # Same quote currency → taker2 same direction as maker
+            amount = amount / self.taker_2_filled_order_price if is_buy else amount * self.taker_2_filled_order_price
         else:
-            open_price = self.taker_1_filled_order_price / self.maker_filled_order_price
-
-        close_price = self.taker_2_filled_order_price
-        if self.maker_filled_order_side == TradeType.BUY:
-            buy_price = open_price
-            sell_price = close_price
-        else:
-            buy_price = close_price
-            sell_price = open_price
-
-        profit = Decimal("100") * (sell_price - buy_price) / buy_price 
+            # Different quote currencies → taker2 opposite of maker
+            amount = amount * self.taker_2_filled_order_price if is_buy else amount / self.taker_2_filled_order_price
+        
+        profit = Decimal("100") * (amount - Decimal("1"))
+        self.log_with_clock(logging.INFO, f"Round-trip: 1 → {amount} = {round(profit, 4)}% profit")
         return profit
 
     def get_target_balance_diff(self, asset, target_amount):
@@ -475,8 +488,14 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def place_maker_orders(self):
         if not self.open_maker_bid_id and self.config.place_bid:
+            # Apply random variance to order amount (fresh random value for each order)
+            actual_variance = Decimal(str(random.uniform(0, float(self.config.maker_order_size_variance_pct))))
+            randomized_order_amount = self.config.order_amount * (Decimal("1") - actual_variance / Decimal("100"))
+            self.log_with_clock(logging.INFO, 
+                f"BID order amount randomized: {self.config.order_amount} → {randomized_order_amount} (-{round(actual_variance, 2)}%)")
+            
             order_price = self.taker_sell_price * Decimal(1 - self.spread / 100)
-            amount = self.get_order_amount_considering_third_asset_balance()
+            amount = self.get_order_amount_considering_third_asset_balance(randomized_order_amount)
             buy_candidate = OrderCandidate(trading_pair=self.config.maker_pair,
                                            is_maker=True,
                                            order_type=OrderType.LIMIT,
@@ -488,8 +507,14 @@ class TriangularXEMM(ScriptStrategyBase):
                 self.open_maker_bid_id = maker_buy_result
 
         if not self.open_maker_ask_id and self.config.place_ask:
+            # Apply random variance to order amount (fresh random value for each order)
+            actual_variance = Decimal(str(random.uniform(0, float(self.config.maker_order_size_variance_pct))))
+            randomized_order_amount = self.config.order_amount * (Decimal("1") - actual_variance / Decimal("100"))
+            self.log_with_clock(logging.INFO, 
+                f"ASK order amount randomized: {self.config.order_amount} → {randomized_order_amount} (-{round(actual_variance, 2)}%)")
+            
             order_price = self.taker_buy_price * Decimal(1 + self.spread / 100)
-            amount = self.get_order_amount_considering_third_asset_balance()
+            amount = self.get_order_amount_considering_third_asset_balance(randomized_order_amount)
             sell_candidate = OrderCandidate(
                 trading_pair=self.config.maker_pair,
                 is_maker=True,
@@ -501,12 +526,12 @@ class TriangularXEMM(ScriptStrategyBase):
             if maker_sell_result:
                 self.open_maker_ask_id = maker_sell_result
 
-    def get_order_amount_considering_third_asset_balance(self):
+    def get_order_amount_considering_third_asset_balance(self, order_amount: Decimal):
         third_asset = self.assets["taker_1_quote"]
         third_asset_balance = self.connector.get_balance(third_asset)
         base_amount_in_third_asset = self.get_base_amount_for_quote_volume(self.config.taker_pair_1, True, third_asset_balance)
         base_amount_in_third_asset *= Decimal(1 - self.config.slippage_buffer_third_asset / 100)
-        amount = min(self.config.order_amount, base_amount_in_third_asset)
+        amount = min(order_amount, base_amount_in_third_asset)
         return amount
 
     def adjust_and_place_order(self, candidate, all_or_none):
@@ -552,8 +577,10 @@ class TriangularXEMM(ScriptStrategyBase):
         self.save_to_csv(time_before_order_sent, order_id, status.name)
         return order_id
 
-    def cancel_all_orders(self):
+    def cancel_all_orders(self, cancel_maker_orders=True):
         for order in self.get_active_orders(self.config.connector_name):
+            if cancel_maker_orders and order.trading_pair != self.config.maker_pair:
+                continue
             self.cancel_order_by_id(self.config.connector_name, order.trading_pair, order.client_order_id)
 
     def cancel_order_by_id(self, connector, pair, order_id):
@@ -633,6 +660,8 @@ class TriangularXEMM(ScriptStrategyBase):
 
     def did_fail_order(self, event: MarketOrderFailureEvent):
         self.log_with_clock(logging.INFO, f"Order {event.order_id} was failed to be placed")
+        self.notify_hb_app_with_timestamp(f"Order {event.order_id} was failed to be placed")
+        self.cancel_order_by_id(self.config.connector_name, self.config.maker_pair, event.order_id)
         self.place_maker_delay_timestamp = self.current_timestamp + self.config.place_maker_delay
         if event.order_id == self.open_maker_bid_id:
             self.open_maker_bid_id = None
@@ -667,8 +696,8 @@ class TriangularXEMM(ScriptStrategyBase):
                 self.taker2_order_filled = True
                 self.taker_2_filled_order_price = event.price
             self.check_and_remove_taker_candidates(event, event.trade_type)
-        msg = (f"fill {event.trade_type.name} {round(event.amount, 5)} {event.trading_pair} {self.config.connector_name} "
-               f"at {round(event.price, 5)}")
+        msg = (f"fill {event.trade_type.name} {round(event.amount, 7)} {event.trading_pair} {self.config.connector_name} "
+               f"at {round(event.price, 7)}")
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
 
