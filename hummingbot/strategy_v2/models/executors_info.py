@@ -13,10 +13,12 @@ from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecut
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_explorer_executor.data_types import XEMMExplorerExecutorConfig
 from hummingbot.strategy_v2.executors.spot_perp_executor.data_types import SpotPerpExecutorConfig
+from hummingbot.strategy_v2.executors.triangular_executor.data_types import TriangularExecutorConfig
+from hummingbot.strategy_v2.executors.rebalance_executor.data_types import RebalanceExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 
-AnyExecutorConfig = Union[PositionExecutorConfig, DCAExecutorConfig, GridExecutorConfig, XEMMExecutorConfig, XEMMExplorerExecutorConfig, ArbitrageExecutorConfig, OrderExecutorConfig, TWAPExecutorConfig, SpotPerpExecutorConfig]
+AnyExecutorConfig = Union[PositionExecutorConfig, DCAExecutorConfig, GridExecutorConfig, XEMMExecutorConfig, XEMMExplorerExecutorConfig, ArbitrageExecutorConfig, OrderExecutorConfig, TWAPExecutorConfig, SpotPerpExecutorConfig, TriangularExecutorConfig, RebalanceExecutorConfig]
 
 
 class ExecutorInfo(BaseModel):

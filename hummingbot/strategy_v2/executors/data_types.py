@@ -14,7 +14,8 @@ from hummingbot.core.data_type.common import TradeType
 class ExecutorConfigBase(BaseModel):
     id: str = None  # Make ID optional
     type: Literal["position_executor", "dca_executor", "grid_executor", "order_executor",
-                  "xemm_executor", "arbitrage_executor", "twap_executor", "xemm_explorer_executor", "spot_perp_executor"]
+                  "xemm_executor", "arbitrage_executor", "twap_executor", "xemm_explorer_executor", "spot_perp_executor", 
+                  "triangular_executor", "rebalance_executor"]
     timestamp: Optional[float] = None
     controller_id: str = "main"
 

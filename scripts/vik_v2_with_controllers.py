@@ -17,10 +17,10 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
 class VikV2WithControllersConfig(StrategyV2ConfigBase):
-    script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
+    script_file_name: str = os.path.basename(__file__)
     candles_config: List[CandlesConfig] = []
     markets: Dict[str, Set[str]] = {}
-    executors_update_interval: float = 0.5
+    # executors_update_interval: float = 0.5
 
 
 class VikV2WithControllers(StrategyV2Base):
@@ -34,19 +34,14 @@ class VikV2WithControllers(StrategyV2Base):
     specific controller and wait until the active executors finalize their execution. The rest of the executors will
     wait until the main strategy stops them.
     """
+    performance_report_interval: int = 1
+
     def __init__(self, connectors: Dict[str, ConnectorBase], config: VikV2WithControllersConfig):
         super().__init__(connectors, config)
         self.config = config
         self.closed_executors_buffer: int = 30
-        self.executor_orchestrator = ExecutorOrchestrator(strategy=self, executors_update_interval=self.config.executors_update_interval)
+        # self.executor_orchestrator = ExecutorOrchestrator(strategy=self, executors_update_interval=self.config.executors_update_interval)
 
-    def start(self, clock: Clock, timestamp: float) -> None:
-        """
-        Start the strategy.
-        :param clock: Clock to use.
-        :param timestamp: Current time.
-        """
-        self._last_timestamp = timestamp
 
     async def on_stop(self):
         await super().on_stop()
