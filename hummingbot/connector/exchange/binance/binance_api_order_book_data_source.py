@@ -1,11 +1,14 @@
 import asyncio
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.binance import binance_constants as CONSTANTS, binance_web_utils as web_utils
 from hummingbot.connector.exchange.binance.binance_order_book import BinanceOrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.event.events import OrderBookBestBidAskEvent, OrderBookDataSourceEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -34,6 +37,7 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        self._trading_pair_cache = {}  # symbol -> trading_pair
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -50,7 +54,7 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         params = {
             "symbol": await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "limit": "1000"
+            "limit": "100"
         }
 
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -71,10 +75,12 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             trade_params = []
             depth_params = []
+            best_bidask_params = []
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 trade_params.append(f"{symbol.lower()}@trade")
                 depth_params.append(f"{symbol.lower()}@depth@100ms")
+                best_bidask_params.append(f"{symbol.lower()}@bookTicker")
             payload = {
                 "method": "SUBSCRIBE",
                 "params": trade_params,
@@ -89,8 +95,16 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
             }
             subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=payload)
 
-            await ws.send(subscribe_trade_request)
+            payload = {
+                "method": "SUBSCRIBE",
+                "params": best_bidask_params,
+                "id": 3
+            }
+            subscribe_best_bidask_request: WSJSONRequest = WSJSONRequest(payload=payload)
+
+            # await ws.send(subscribe_trade_request)
             await ws.send(subscribe_orderbook_request)
+            await ws.send(subscribe_best_bidask_request)
 
             self.logger().info("Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
@@ -136,6 +150,45 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
         channel = ""
         if "result" not in event_message:
             event_type = event_message.get("e")
-            channel = (self._diff_messages_queue_key if event_type == CONSTANTS.DIFF_EVENT_TYPE
-                       else self._trade_messages_queue_key)
+            # channel = (self._diff_messages_queue_key if event_type == CONSTANTS.DIFF_EVENT_TYPE
+            #            else self._trade_messages_queue_key)
+            if event_type == CONSTANTS.TRADE_EVENT_TYPE:
+                channel = self._trade_messages_queue_key
+            elif event_type == CONSTANTS.DIFF_EVENT_TYPE:
+                channel = self._diff_messages_queue_key
+            else:
+                safe_ensure_future(self._trigger_best_bidask_event(event_message))
         return channel
+
+    async def _trigger_best_bidask_event(self, event_message: Dict[str, Any]) -> None:
+        # self.logger().info(f">>>(binance) RAW BEST BID ASK message: {event_message}")
+        if event_message.get("s"):
+            trading_pair = self._get_trading_pair_from_cache(event_message["s"])
+
+            best_bid_price = Decimal(str(event_message["b"]))
+            best_ask_price = Decimal(str(event_message["a"]))
+            best_bid_size = Decimal(str(event_message["B"]))
+            best_ask_size = Decimal(str(event_message["A"]))
+            self._connector.trigger_event(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, OrderBookBestBidAskEvent(trading_pair, best_bid_price, best_ask_price, best_bid_size, best_ask_size))
+
+    def _get_trading_pair_from_cache(self, exchange_symbol: str) -> str:
+        """
+        Get trading pair from cache using exchange symbol.
+        Builds cache lazily on first call.
+
+        Args:
+            exchange_symbol: Exchange symbol (e.g., 'BTCUSDT')
+
+        Returns:
+            str: Trading pair (e.g., 'BTC-USDT')
+        """
+        # Check if symbol is already in cache
+        if exchange_symbol in self._trading_pair_cache:
+            return self._trading_pair_cache[exchange_symbol]
+
+        # If not in cache, get it using the sync method and cache it
+        trading_pair = self._connector.trading_pair_associated_to_exchange_symbol_sync(exchange_symbol)
+        self.logger().info(f">>>(binance) New pair cache: {exchange_symbol} -> {trading_pair}")
+        self._trading_pair_cache[exchange_symbol] = trading_pair
+
+        return trading_pair

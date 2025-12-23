@@ -44,6 +44,7 @@ class OrderBookDataSourceEvent(int, Enum):
     SNAPSHOT_EVENT = 1001
     DIFF_EVENT = 1002
     TRADE_EVENT = 1003
+    BEST_BID_ASK_EVENT = 1004
 
 
 class TokenApprovalEvent(Enum):
@@ -156,6 +157,14 @@ class OrderBookTradeEvent(NamedTuple):
     amount: Decimal
     trade_id: Optional[str] = None
     is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
+
+
+class OrderBookBestBidAskEvent(NamedTuple):
+    trading_pair: str
+    best_bid_price: Decimal
+    best_ask_price: Decimal
+    best_bid_size: Decimal
+    best_ask_size: Decimal
 
 
 class OrderFilledEvent(NamedTuple):

@@ -338,7 +338,7 @@ class BinanceExchange(ExchangePyBase):
                         self._order_tracker.process_order_update(order_update=order_update)
 
                 elif event_type == "outboundAccountPosition":
-                    self.logger().info(f"Outbound account position event: {event_message}")
+                    # self.logger().info(f"Outbound account position event: {event_message}")
                     balances = event_message["B"]
                     for balance_entry in balances:
                         asset_name = balance_entry["a"]

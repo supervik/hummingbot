@@ -107,6 +107,18 @@ cdef class ExchangeBase(ConnectorBase):
         symbol_map = await self.trading_pair_symbol_map()
         return symbol_map[symbol]
 
+    def trading_pair_associated_to_exchange_symbol_sync(self, symbol: str) -> str:
+        """
+        Synchronous version to translate a trading pair from the exchange notation to the client notation
+
+        :param symbol: trading pair in exchange notation
+
+        :return: trading pair in client notation
+        """
+        if not self.trading_pair_symbol_map_ready():
+            raise ValueError("Trading pair symbol map is not ready. Initialize it first.")
+        return self._trading_pair_symbol_map[symbol]
+
     async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
         """
         Return a dictionary the trading_pair as key and the current price as value for each trading pair passed as

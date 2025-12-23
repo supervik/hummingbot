@@ -11,6 +11,8 @@ from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
+    OrderBookBestBidAskEvent,
+    OrderBookDataSourceEvent,
     OrderCancelledEvent,
     OrderFilledEvent,
     SellOrderCompletedEvent,
@@ -27,6 +29,7 @@ from hummingbot.strategy_v2.executors.triangular_executor.data_types import (
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 
 
 class TriangularExecutor(ExecutorBase):
@@ -56,21 +59,46 @@ class TriangularExecutor(ExecutorBase):
         self.completion_timestamp: Optional[float] = None
         self.place_buy_order = False if self.config.quote_amount == Decimal("0") else True
         self.place_sell_order = False if self.config.base_amount == Decimal("0") else True
+        self.best_bidask_event_taker_1 = None
+        self.best_bidask_event_taker_2 = None
         # self.trading_rules_taker_1 = self.get_trading_rules(self.config.connector_name, self.config.taker_1_pair)
         # self.trading_rules_taker_2 = self.get_trading_rules(self.config.connector_name, self.config.taker_2_pair)
+        
+        self._best_bidask_forwarder = SourceInfoEventForwarder(self.process_best_bidask_event)
 
+    async def on_start(self):
+        """
+        Initializes the executor. If liquidate_base_assets is configured,
+        liquidates assets and stops. Otherwise proceeds with normal startup.
+        """
+        self.subscribe_to_events()
+        await super().on_start()
+    
+    def on_stop(self):
+        self.unsubscribe_from_events()
+        super().on_stop()
+
+    def subscribe_to_events(self):
+        self.logger().info(f"Subscribing to best bid and ask")
+        self.connectors[self.config.connector_name].add_listener(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, self._best_bidask_forwarder)
+    
+    def unsubscribe_from_events(self):
+        self.logger().info(f"Unsubscribing from best bid and ask")
+        self.connectors[self.config.connector_name].remove_listener(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, self._best_bidask_forwarder)
+    
     async def control_task(self):
         """
         Control the order execution process based on the execution strategy.
         """
         if self.status == RunnableStatus.RUNNING:
+            self.logger().info(f"--- Control task running")
             if self.hedge_mode and self.active_hedging_states:
                 await self.process_hedging_states()
             await self.update_taker_prices()
             await self.control_maker_order()
             await self.place_maker_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
-            self.logger().info(f"TriangularExecutor is shutting down")
+            self.logger().info(f"TriangularExecutor is shutting down.")
             self.stop()
 
     async def process_hedging_states(self):
@@ -114,7 +142,7 @@ class TriangularExecutor(ExecutorBase):
                 self.logger().info(f"All hedging states completed. Waiting {self.config.completion_wait_time}s before stopping executor.")
             elif current_time - self.completion_timestamp >= self.config.completion_wait_time:
                 # Wait time elapsed - stop executor
-                self.logger().info(f"Completion wait time elapsed. Stopping executor.")
+                self.logger().info(f"Completion wait time elapsed. Stopping executor. PNL: {self.get_net_pnl_pct()}%")
                 self.close_type = CloseType.COMPLETED
                 self._status = RunnableStatus.SHUTTING_DOWN
 
@@ -207,6 +235,7 @@ class TriangularExecutor(ExecutorBase):
             order_buy_price = self.maker_bid_order.order.price
             potential_sell_price = self.taker_result_sell_price
             self.check_and_cancel_maker_order(self.maker_bid_order, order_buy_price, potential_sell_price, "Bid")
+            self.calculate_current_profitability(order_buy_price, TradeType.BUY)
 
         if self.maker_ask_order and self.maker_ask_order.order and self.maker_ask_order.order.is_open:
             order_sell_price = self.maker_ask_order.order.price
@@ -291,7 +320,8 @@ class TriangularExecutor(ExecutorBase):
                     ),
                     created_timestamp=time.time(),
                 )
-                
+                self.logger().info(f"Calculating current profitability after filled maker order {event.order_id}")
+                self.calculate_current_profitability(event.price, event.trade_type)
                 self.active_hedging_states.append(hedging_state)
                 self.logger().info(f"Created new HedgingState for maker order {event.order_id}")
                 
@@ -515,3 +545,49 @@ class TriangularExecutor(ExecutorBase):
         :return: The cumulative fees in quote currency.
         """
         return Decimal("0")
+
+    
+    def process_best_bidask_event(self, event_tag: int, market, event: OrderBookBestBidAskEvent):
+        if event.trading_pair != self.config.taker_1_pair and event.trading_pair != self.config.taker_2_pair:
+            return
+        # self.logger().info(f"--- Received order book best bid/ask event for {event.trading_pair}: {event}")
+        if event.trading_pair == self.config.taker_1_pair:
+            # self.logger().info(f"--- Received order book best bid/ask event for taker 1: {event}")
+            self.best_bidask_event_taker_1 = event
+        elif event.trading_pair == self.config.taker_2_pair:
+            # self.logger().info(f"--- Received  order book best bid/ask event for taker 2: {event}")
+            self.best_bidask_event_taker_2 = event
+
+    def calculate_current_profitability(self, price: Decimal, trade_type: TradeType):           
+        hb_taker_1_ask_price = self.get_price(self.config.connector_name, self.config.taker_1_pair, price_type=PriceType.BestAsk)
+        hb_taker_1_bid_price = self.get_price(self.config.connector_name, self.config.taker_1_pair, price_type=PriceType.BestBid)
+        hb_taker_2_ask_price = self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=PriceType.BestAsk)
+        hb_taker_2_bid_price = self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=PriceType.BestBid)
+
+        self.logger().info(f"HBBOT prices: taker 1: {hb_taker_1_bid_price}, {hb_taker_1_ask_price}, taker 2: {hb_taker_2_bid_price}, {hb_taker_2_ask_price}") 
+
+
+        if self.best_bidask_event_taker_1 and self.best_bidask_event_taker_2:
+            event_taker_1_ask_price = self.best_bidask_event_taker_1.best_ask_price
+            event_taker_1_bid_price = self.best_bidask_event_taker_1.best_bid_price
+            event_taker_2_ask_price = self.best_bidask_event_taker_2.best_ask_price
+            event_taker_2_bid_price = self.best_bidask_event_taker_2.best_bid_price
+
+            self.logger().info(f"EVENT prices: taker 1: {event_taker_1_bid_price}, {event_taker_1_ask_price}, taker 2: {event_taker_2_bid_price}, {event_taker_2_ask_price}") 
+
+            if trade_type == TradeType.BUY:
+                self.calculate_profit(price, event_taker_1_bid_price / event_taker_2_ask_price, "EVENT")
+            else:
+                self.calculate_profit(event_taker_1_ask_price / event_taker_2_bid_price, price, "EVENT")
+        
+        if trade_type == TradeType.BUY:
+            self.calculate_profit(price, hb_taker_1_bid_price / hb_taker_2_ask_price, "HBBOT")
+        else:
+            self.calculate_profit(hb_taker_1_ask_price / hb_taker_2_bid_price, price, "HBBOT")
+            
+
+
+    def calculate_profit(self, buy_price: Decimal, sell_price: Decimal, type: str):
+        profitability = Decimal("100") * (sell_price - buy_price) / buy_price - self.total_fee_pct
+        self.logger().info(f"Profitability for {type} type: {profitability}")
+        return profitability
