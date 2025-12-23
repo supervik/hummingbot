@@ -168,6 +168,6 @@ class TriangularMultiple(ControllerBase):
         status.append(f"Triangular Multiple Controller: {self.config.id}")
         status.append(f"Controller status: {self._status}")
         status.append(f"Triangle Info: {self.config.triangle_info}")
-        for executor in self.executors_info:
-            status.append(f"\n{executor}")
+        # for executor in self.executors_info:
+        #     status.append(f"\n{executor}")
         return status

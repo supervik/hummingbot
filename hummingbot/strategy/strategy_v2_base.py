@@ -449,9 +449,9 @@ class StrategyV2Base(ScriptStrategyBase):
             # Last 6 executors table
             executors_list = self.get_executors_by_controller(controller_id)
             if executors_list:
-                lines.append("\n  Recent Executors (Last 6):")
+                lines.append("\n  Recent Executors (Last 20):")
                 # Sort by timestamp and take last 6
-                recent_executors = sorted(executors_list, key=lambda x: x.timestamp, reverse=True)[:6]
+                recent_executors = sorted(executors_list, key=lambda x: x.timestamp, reverse=True)[:20]
                 executors_df = self.executors_info_to_df(recent_executors)
                 if not executors_df.empty:
                     executors_df["age"] = self.current_timestamp - executors_df["timestamp"]

@@ -5,8 +5,10 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
@@ -28,8 +30,6 @@ from hummingbot.strategy_v2.executors.triangular_executor.data_types import (
 )
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
-from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 
 
 class TriangularExecutor(ExecutorBase):
@@ -43,7 +43,7 @@ class TriangularExecutor(ExecutorBase):
 
     def __init__(self, strategy: ScriptStrategyBase, config: TriangularExecutorConfig,
                  update_interval: float = 1.0, max_retries: int = 10):
-        
+
         super().__init__(strategy=strategy, config=config, connectors=[config.connector_name],
                          update_interval=update_interval)
         self.config: TriangularExecutorConfig = config
@@ -63,7 +63,7 @@ class TriangularExecutor(ExecutorBase):
         self.best_bidask_event_taker_2 = None
         # self.trading_rules_taker_1 = self.get_trading_rules(self.config.connector_name, self.config.taker_1_pair)
         # self.trading_rules_taker_2 = self.get_trading_rules(self.config.connector_name, self.config.taker_2_pair)
-        
+
         self._best_bidask_forwarder = SourceInfoEventForwarder(self.process_best_bidask_event)
 
     async def on_start(self):
@@ -73,7 +73,7 @@ class TriangularExecutor(ExecutorBase):
         """
         self.subscribe_to_events()
         await super().on_start()
-    
+
     def on_stop(self):
         self.unsubscribe_from_events()
         super().on_stop()
@@ -81,11 +81,11 @@ class TriangularExecutor(ExecutorBase):
     def subscribe_to_events(self):
         self.logger().info(f"Subscribing to best bid and ask")
         self.connectors[self.config.connector_name].add_listener(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, self._best_bidask_forwarder)
-    
+
     def unsubscribe_from_events(self):
         self.logger().info(f"Unsubscribing from best bid and ask")
         self.connectors[self.config.connector_name].remove_listener(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, self._best_bidask_forwarder)
-    
+
     async def control_task(self):
         """
         Control the order execution process based on the execution strategy.
@@ -130,7 +130,7 @@ class TriangularExecutor(ExecutorBase):
                             taker_info.sent_timestamp is None or
                             (current_time - taker_info.sent_timestamp >= self.config.taker_retry_delay)
                         )
-                        
+
                         if should_retry and taker_info.trials < self.config.max_taker_retries:
                             self.logger().info(f"Retrying {taker_name} order (trial {taker_info.trials + 1}) for state created at {state.created_timestamp}")
                             self.place_taker_order(taker_info, log_retry=True)
@@ -150,7 +150,7 @@ class TriangularExecutor(ExecutorBase):
         """
         Update the prices of the maker and taker orders.
         """
-        maker_bid_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestBid) 
+        maker_bid_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestBid)
         maker_ask_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestAsk)
 
         # Sell order on maker buy on taker
@@ -165,7 +165,7 @@ class TriangularExecutor(ExecutorBase):
             # self.logger().info(f"sell side taker_1_price: {sell_side_taker_1_price}")
             # self.logger().info(f"sell side taker_2_price: {sell_side_taker_2_price}")
             # self.logger().info(f"sell side target_profit_with_fees: {self.targer_profit_with_fees}")
-            # self.logger().info(f"sell side maker_target_sell_price: {self.maker_target_sell_price}")          
+            # self.logger().info(f"sell side maker_target_sell_price: {self.maker_target_sell_price}")
 
         # Buy order on maker sell on taker
         if self.place_buy_order:
@@ -186,7 +186,6 @@ class TriangularExecutor(ExecutorBase):
         """Get the resulting price for a given amount"""
         return await self.connectors[connector].get_quote_price(trading_pair, is_buy, order_amount)
 
-    
     async def place_maker_order(self):
         """
         Place the maker order.
@@ -216,7 +215,7 @@ class TriangularExecutor(ExecutorBase):
         if adjusted_candidate.amount == Decimal("0"):
             self.logger().info(f"Not enough balance to place maker {side.name} order amount {amount} at price {price} on {self.config.maker_pair}")
             return None
-        
+
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.maker_pair,
@@ -241,7 +240,7 @@ class TriangularExecutor(ExecutorBase):
             order_sell_price = self.maker_ask_order.order.price
             potential_buy_price = self.taker_result_buy_price
             self.check_and_cancel_maker_order(self.maker_ask_order, potential_buy_price, order_sell_price, "Ask")
-    
+
     def check_and_cancel_maker_order(self, order: TrackedOrder, buy_price: Decimal, sell_price: Decimal , type: str):
         profitability = Decimal("100") * (sell_price - buy_price) / buy_price - self.total_fee_pct
         # self.logger().info(f"{type} order {order.order_id} Trade profitability {profitability} on {self.config.maker_pair}")
@@ -249,7 +248,6 @@ class TriangularExecutor(ExecutorBase):
             self.logger().info(f"{type} order {order.order_id} Trade profitability {profitability} on {self.config.maker_pair} is out of profitability range. Cancelling order.")
             self._strategy.cancel(self.config.connector_name, self.config.maker_pair, order.order_id)
 
-    
     def process_order_created_event(self,
                                     event_tag: int,
                                     market: ConnectorBase,
@@ -266,9 +264,9 @@ class TriangularExecutor(ExecutorBase):
             self.maker_ask_order.order = self.get_in_flight_order(self.config.connector_name, event.order_id)
 
     def process_order_canceled_event(self,
-                                    event_tag: int,
-                                    market: ConnectorBase,
-                                    event: OrderCancelledEvent):
+                                     event_tag: int,
+                                     market: ConnectorBase,
+                                     event: OrderCancelledEvent):
         """
         Handles order cancelled events from the exchange.
         Clears the maker order tracking when the maker order is cancelled.
@@ -280,7 +278,6 @@ class TriangularExecutor(ExecutorBase):
             self.logger().info(f"Maker ask order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_ask_order = None
 
-    
     def process_order_filled_event(self,
                                    event_tag: int,
                                    market: ConnectorBase,
@@ -300,12 +297,12 @@ class TriangularExecutor(ExecutorBase):
                 if not self.hedge_mode:
                     self.hedge_mode = True
                     self.logger().info(f"---- Hedge mode enabled ----")
-                
+
                 # Create HedgingState
                 taker_1_side = TradeType.SELL if event.trade_type == TradeType.BUY else TradeType.BUY
                 taker_2_side = event.trade_type
                 taker_2_amount = event.amount * event.price
-                
+
                 hedging_state = HedgingState(
                     maker_fill=event,
                     taker_1=TakerOrderInfo(
@@ -324,12 +321,12 @@ class TriangularExecutor(ExecutorBase):
                 self.calculate_current_profitability(event.price, event.trade_type)
                 self.active_hedging_states.append(hedging_state)
                 self.logger().info(f"Created new HedgingState for maker order {event.order_id}")
-                
+
                 # Place taker orders
                 self.place_taker_order(hedging_state.taker_1)
                 self.place_taker_order(hedging_state.taker_2)
                 self.cancel_maker_orders()
-        
+
         # Taker order filled - find matching HedgingState
         else:
             for state in self.active_hedging_states:
@@ -354,12 +351,12 @@ class TriangularExecutor(ExecutorBase):
             if event.order_id == state.taker_1.order_id:
                 state.taker_1.completed = event
                 self.logger().info(f"Taker 1 order completed, id = {event.order_id}, "
-                                 f"base_amount = {event.base_asset_amount}, quote_amount = {event.quote_asset_amount}")
+                                   f"base_amount = {event.base_asset_amount}, quote_amount = {event.quote_asset_amount}")
                 break
             elif event.order_id == state.taker_2.order_id:
                 state.taker_2.completed = event
                 self.logger().info(f"Taker 2 order completed, id = {event.order_id}, "
-                                 f"base_amount = {event.base_asset_amount}, quote_amount = {event.quote_asset_amount}")
+                                   f"base_amount = {event.base_asset_amount}, quote_amount = {event.quote_asset_amount}")
                 break
 
     def is_order_size_less_than_min(self, order_amount: Decimal):
@@ -371,11 +368,10 @@ class TriangularExecutor(ExecutorBase):
         self.logger().info(f"order_amount in usdt: {order_amount * conversion_rate}")
         return order_amount * conversion_rate < self.config.min_usdt
 
-    
     def place_taker_order(self, taker_info: TakerOrderInfo, log_retry: bool = False) -> Optional[str]:
         """
         Place a taker order and update tracking.
-        
+
         :param taker_info: The TakerOrderInfo to place order for
         :param log_retry: Whether to log retry messages
         :return: The order_id if successful, None otherwise
@@ -389,13 +385,13 @@ class TriangularExecutor(ExecutorBase):
             taker_info.order_id = order_id
             taker_info.sent_timestamp = time.time()
         taker_info.trials += 1
-        
+
         if log_retry:
             if order_id:
                 self.logger().info(f"Retried taker order on {taker_info.trading_pair}, new order_id = {order_id}, trial = {taker_info.trials}")
             else:
                 self.logger().warning(f"Failed to retry taker order on {taker_info.trading_pair}, trial = {taker_info.trials}")
-        
+
         return order_id
 
     def send_taker_order_to_exchange(self, trading_pair: str, side: TradeType, amount: Decimal):
@@ -418,7 +414,7 @@ class TriangularExecutor(ExecutorBase):
         # if adjusted_candidate.amount == Decimal("0"):
         #     self.logger().info(f"Not enough balance to place taker {side.name} order amount {amount} on {trading_pair}")
         #     return None
-        
+
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=trading_pair,
@@ -427,10 +423,9 @@ class TriangularExecutor(ExecutorBase):
             amount=amount,
             price=Decimal("0"))
         self.logger().info(f"Sent taker {side.name} order amount {amount} on {trading_pair}, id = {order_id} ")
-        
+
         return order_id
 
-    
     def cancel_maker_orders(self):
         """
         Cancels the maker orders.
@@ -443,7 +438,6 @@ class TriangularExecutor(ExecutorBase):
             self.logger().info(f"Cancelling maker ask order id = {self.maker_ask_order.order_id} on {self.config.maker_pair}")
             self._strategy.cancel(self.config.connector_name, self.config.maker_pair, self.maker_ask_order.order_id)
 
-    
     async def validate_sufficient_balance(self):
         """
         Validates that the executor has sufficient balance to place orders.
@@ -546,7 +540,6 @@ class TriangularExecutor(ExecutorBase):
         """
         return Decimal("0")
 
-    
     def process_best_bidask_event(self, event_tag: int, market, event: OrderBookBestBidAskEvent):
         if event.trading_pair != self.config.taker_1_pair and event.trading_pair != self.config.taker_2_pair:
             return
@@ -558,14 +551,13 @@ class TriangularExecutor(ExecutorBase):
             # self.logger().info(f"--- Received  order book best bid/ask event for taker 2: {event}")
             self.best_bidask_event_taker_2 = event
 
-    def calculate_current_profitability(self, price: Decimal, trade_type: TradeType):           
+    def calculate_current_profitability(self, price: Decimal, trade_type: TradeType):
         hb_taker_1_ask_price = self.get_price(self.config.connector_name, self.config.taker_1_pair, price_type=PriceType.BestAsk)
         hb_taker_1_bid_price = self.get_price(self.config.connector_name, self.config.taker_1_pair, price_type=PriceType.BestBid)
         hb_taker_2_ask_price = self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=PriceType.BestAsk)
         hb_taker_2_bid_price = self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=PriceType.BestBid)
 
-        self.logger().info(f"HBBOT prices: taker 1: {hb_taker_1_bid_price}, {hb_taker_1_ask_price}, taker 2: {hb_taker_2_bid_price}, {hb_taker_2_ask_price}") 
-
+        self.logger().info(f"HBBOT prices: taker 1: {hb_taker_1_bid_price}, {hb_taker_1_ask_price}, taker 2: {hb_taker_2_bid_price}, {hb_taker_2_ask_price}")
 
         if self.best_bidask_event_taker_1 and self.best_bidask_event_taker_2:
             event_taker_1_ask_price = self.best_bidask_event_taker_1.best_ask_price
@@ -573,19 +565,17 @@ class TriangularExecutor(ExecutorBase):
             event_taker_2_ask_price = self.best_bidask_event_taker_2.best_ask_price
             event_taker_2_bid_price = self.best_bidask_event_taker_2.best_bid_price
 
-            self.logger().info(f"EVENT prices: taker 1: {event_taker_1_bid_price}, {event_taker_1_ask_price}, taker 2: {event_taker_2_bid_price}, {event_taker_2_ask_price}") 
+            self.logger().info(f"EVENT prices: taker 1: {event_taker_1_bid_price}, {event_taker_1_ask_price}, taker 2: {event_taker_2_bid_price}, {event_taker_2_ask_price}")
 
             if trade_type == TradeType.BUY:
                 self.calculate_profit(price, event_taker_1_bid_price / event_taker_2_ask_price, "EVENT")
             else:
                 self.calculate_profit(event_taker_1_ask_price / event_taker_2_bid_price, price, "EVENT")
-        
+
         if trade_type == TradeType.BUY:
             self.calculate_profit(price, hb_taker_1_bid_price / hb_taker_2_ask_price, "HBBOT")
         else:
             self.calculate_profit(hb_taker_1_ask_price / hb_taker_2_bid_price, price, "HBBOT")
-            
-
 
     def calculate_profit(self, buy_price: Decimal, sell_price: Decimal, type: str):
         profitability = Decimal("100") * (sell_price - buy_price) / buy_price - self.total_fee_pct

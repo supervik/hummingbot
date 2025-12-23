@@ -20,7 +20,7 @@ class VikV2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     candles_config: List[CandlesConfig] = []
     markets: Dict[str, Set[str]] = {}
-    # executors_update_interval: float = 0.5
+    executors_update_interval: float = 0.5
 
 
 class VikV2WithControllers(StrategyV2Base):
@@ -40,7 +40,7 @@ class VikV2WithControllers(StrategyV2Base):
         super().__init__(connectors, config)
         self.config = config
         self.closed_executors_buffer: int = 30
-        # self.executor_orchestrator = ExecutorOrchestrator(strategy=self, executors_update_interval=self.config.executors_update_interval)
+        self.executor_orchestrator = ExecutorOrchestrator(strategy=self, executors_update_interval=self.config.executors_update_interval)
 
 
     async def on_stop(self):
