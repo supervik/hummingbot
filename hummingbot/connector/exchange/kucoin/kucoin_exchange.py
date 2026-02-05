@@ -57,7 +57,7 @@ class KucoinExchange(ExchangePyBase):
 
     @property
     def name(self) -> str:
-        return "kucoin"
+        return "kucoin_hft" if self._domain == "hft" else "kucoin"
 
     @property
     def rate_limits_rules(self):

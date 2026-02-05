@@ -161,6 +161,7 @@ class OrderBookTradeEvent(NamedTuple):
 
 class OrderBookBestBidAskEvent(NamedTuple):
     trading_pair: str
+    ticker_id: str
     best_bid_price: Decimal
     best_ask_price: Decimal
     best_bid_size: Decimal

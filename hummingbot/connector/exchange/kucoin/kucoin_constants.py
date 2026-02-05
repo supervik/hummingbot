@@ -41,6 +41,7 @@ WS_PING_HEARTBEAT = 10
 
 DIFF_EVENT_TYPE = "trade.l2update"
 TRADE_EVENT_TYPE = "trade.l3match"
+LEVEL1_EVENT_TYPE = "level1"
 ORDER_CHANGE_EVENT_TYPE = "orderChange"
 BALANCE_EVENT_TYPE = "account.balance"
 

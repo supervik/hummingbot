@@ -169,7 +169,8 @@ class BinanceAPIOrderBookDataSource(OrderBookTrackerDataSource):
             best_ask_price = Decimal(str(event_message["a"]))
             best_bid_size = Decimal(str(event_message["B"]))
             best_ask_size = Decimal(str(event_message["A"]))
-            self._connector.trigger_event(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, OrderBookBestBidAskEvent(trading_pair, best_bid_price, best_ask_price, best_bid_size, best_ask_size))
+            ticker_id = event_message.get("u", "")
+            self._connector.trigger_event(OrderBookDataSourceEvent.BEST_BID_ASK_EVENT, OrderBookBestBidAskEvent(trading_pair, ticker_id, best_bid_price, best_ask_price, best_bid_size, best_ask_size))
 
     def _get_trading_pair_from_cache(self, exchange_symbol: str) -> str:
         """
