@@ -1,9 +1,11 @@
 import os
+from decimal import Decimal
 from typing import Dict, List, Set
 
 import pandas as pd
 from pydantic import Field
 
+from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -21,6 +23,13 @@ class VikV2WithControllersConfig(StrategyV2ConfigBase):
     candles_config: List[CandlesConfig] = []
     markets: Dict[str, Set[str]] = {}
     executors_update_interval: float = 0.5
+    
+    # Global kill switch configuration
+    kill_switch_enabled: bool = True
+    kill_switch_asset: str = "USDT"
+    kill_switch_rate_pct: Decimal = Decimal("-3")
+    kill_switch_check_interval: int = 60
+    kill_switch_counter_limit: int = 5
 
 
 class VikV2WithControllers(StrategyV2Base):
@@ -41,6 +50,11 @@ class VikV2WithControllers(StrategyV2Base):
         self.config = config
         self.closed_executors_buffer: int = 30
         self.executor_orchestrator = ExecutorOrchestrator(strategy=self, executors_update_interval=self.config.executors_update_interval)
+        
+        # Global kill switch state
+        self.kill_switch_max_balance: Decimal = Decimal("0")
+        self.kill_switch_counter: int = 0
+        self._last_kill_switch_check_timestamp: float = 0.0
 
 
     async def on_stop(self):
@@ -48,6 +62,8 @@ class VikV2WithControllers(StrategyV2Base):
 
     def on_tick(self):
         super().on_tick()
+        if self.config.kill_switch_enabled:
+            self.check_balance_kill_switch()
 
     # @staticmethod
     # def executors_info_to_df(executors_info: List[ExecutorInfo]) -> pd.DataFrame:
@@ -104,3 +120,69 @@ class VikV2WithControllers(StrategyV2Base):
         df = pd.DataFrame(data=data, columns=columns)
         df.sort_values(by=["Market", "Pair"], inplace=True)
         return df
+    
+    def check_balance_kill_switch(self) -> None:
+        """
+        Periodically checks the balance of kill_switch_asset (rebalance_asset) and
+        stops Hummingbot if drawdown exceeds kill_switch_rate_pct for
+        kill_switch_counter_limit consecutive checks.
+        """
+        # Check if enough time has passed since last check
+        if self.current_timestamp - self._last_kill_switch_check_timestamp < self.config.kill_switch_check_interval:
+            return
+        
+        self._last_kill_switch_check_timestamp = self.current_timestamp
+        
+        # Get connector - assume single connector for now
+        if not self.connectors:
+            return
+        
+        connector_name = list(self.connectors.keys())[0]
+        connector = self.connectors[connector_name]
+        
+        try:
+            current_balance = connector.get_balance(self.config.kill_switch_asset)
+        except Exception as e:
+            self.logger().warning(f"Failed to get balance for {self.config.kill_switch_asset}: {e}")
+            return
+        
+        # Initialize max balance on first check
+        if self.kill_switch_max_balance == Decimal("0"):
+            self.kill_switch_max_balance = current_balance
+            self.kill_switch_counter = 0
+            self.logger().info(
+                f"Kill switch initialized. {self.config.kill_switch_asset} balance: {current_balance}, "
+                f"threshold: {self.config.kill_switch_rate_pct}%"
+            )
+            return
+        
+        # Check if balance increased (reset counter and update max)
+        if current_balance >= self.kill_switch_max_balance:
+            if current_balance > self.kill_switch_max_balance:
+                self.kill_switch_max_balance = current_balance
+            self.kill_switch_counter = 0
+            return
+        
+        # Calculate drawdown percentage
+        diff_pct = Decimal("100") * (current_balance / self.kill_switch_max_balance - Decimal("1"))
+        
+        # Check if drawdown exceeds threshold
+        if diff_pct < self.config.kill_switch_rate_pct:
+            self.kill_switch_counter += 1
+            self.logger().warning(
+                f"Kill switch check: {self.config.kill_switch_asset} balance drawdown {diff_pct:.2f}% "
+                f"(current: {current_balance}, max: {self.kill_switch_max_balance}). "
+                f"Counter: {self.kill_switch_counter}/{self.config.kill_switch_counter_limit}"
+            )
+            
+            # Trigger kill switch if counter exceeds limit
+            if self.kill_switch_counter > self.config.kill_switch_counter_limit:
+                self.logger().error(
+                    f"!!! Global kill switch triggered! {self.config.kill_switch_asset} balance drawdown "
+                    f"{diff_pct:.2f}% exceeded threshold {self.config.kill_switch_rate_pct}% for "
+                    f"{self.kill_switch_counter} consecutive checks. Stopping Hummingbot."
+                )
+                HummingbotApplication.main_application().stop()
+        else:
+            # Drawdown is within acceptable range, reset counter
+            self.kill_switch_counter = 0

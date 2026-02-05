@@ -1,13 +1,13 @@
-import asyncio
+import csv
 import logging
+import os
 import time
 from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
-from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -26,14 +26,22 @@ from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.triangular_executor.data_types import (
     HedgingState,
     TakerOrderInfo,
+    TakerPairDepthTracker,
     TriangularExecutorConfig,
 )
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
+# TODO: Make csv file with cancelled order timestamps (transactTime) from exchange: both for hb and ws
+# TODO: Run both file with minimal profitaility to check if the ws is faster than hb
+# TODO: Run both files in parralel for some time and compare the results
+# TODO: Add websocket to Binance connector and repeat the experiment
+# Find who is faster: hb or ws and fix hb if needed
 
 class TriangularExecutor(ExecutorBase):
     _logger = None
+    MIN_DEPTH_SAMPLES = 10  # Minimum samples required before using depth for calculations
+    CSV_SYNC_PATH = "scripts/data/triangular_sync_snapshot.csv"
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -50,19 +58,33 @@ class TriangularExecutor(ExecutorBase):
         self.taker_result_buy_price = Decimal("0")
         self.taker_result_sell_price = Decimal("0")
         self.total_fee_pct = self.config.fee_maker + 2 * self.config.fee_taker
-        self.targer_profit_with_fees = (self.config.min_profit + self.config.max_profit) / 2 + self.total_fee_pct
+        self.target_profit_with_fees = (self.config.min_profit + self.config.max_profit) / 2 + self.total_fee_pct
+        self.maker_target_buy_price = Decimal("0")
+        self.maker_target_sell_price = Decimal("0")
         self.maker_bid_order = None
         self.maker_ask_order = None
+        self.maker_bid_cancellation_in_progress = False
+        self.maker_ask_cancellation_in_progress = False
+        self.last_buy_order_placed_minute: Optional[int] = None
+        self.last_sell_order_placed_minute: Optional[int] = None
         self.usdt_pair = config.taker_1_pair
         self.hedge_mode = False
         self.active_hedging_states: List[HedgingState] = []
         self.completion_timestamp: Optional[float] = None
         self.place_buy_order = False if self.config.quote_amount == Decimal("0") else True
         self.place_sell_order = False if self.config.base_amount == Decimal("0") else True
-        self.best_bidask_event_taker_1 = None
-        self.best_bidask_event_taker_2 = None
-        # self.trading_rules_taker_1 = self.get_trading_rules(self.config.connector_name, self.config.taker_1_pair)
-        # self.trading_rules_taker_2 = self.get_trading_rules(self.config.connector_name, self.config.taker_2_pair)
+        
+        # Track activity timestamps for stuck executor detection
+        self.last_maker_order_timestamp: Optional[float] = None
+        self.last_taker_order_timestamp: Optional[float] = None
+        self.last_activity_timestamp: float = time.time()
+        self.trading_rules_maker = self.get_trading_rules(self.config.connector_name, self.config.maker_pair)
+        self.trading_rules_taker_1 = self.get_trading_rules(self.config.connector_name, self.config.taker_1_pair)
+        self.trading_rules_taker_2 = self.get_trading_rules(self.config.connector_name, self.config.taker_2_pair)
+
+        # Initialize depth trackers for both taker pairs
+        self.taker_1_depth = TakerPairDepthTracker()
+        self.taker_2_depth = TakerPairDepthTracker()
 
         self._best_bidask_forwarder = SourceInfoEventForwarder(self.process_best_bidask_event)
 
@@ -72,6 +94,18 @@ class TriangularExecutor(ExecutorBase):
         liquidates assets and stops. Otherwise proceeds with normal startup.
         """
         self.subscribe_to_events()
+        self.logger().info(f"Maker trading rules: {self.trading_rules_maker}")
+        self.logger().info(f"Taker 1 trading rules: {self.trading_rules_taker_1}")
+        self.logger().info(f"Taker 2 trading rules: {self.trading_rules_taker_2}")
+        
+        # Initialize CSV sync file (create fresh file on each run)
+        csv_path = self.CSV_SYNC_PATH
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'minute', 'target_price', 'order_id'])
+        self.logger().info(f"Initialized CSV sync file: {csv_path}")
+        
         await super().on_start()
 
     def on_stop(self):
@@ -91,14 +125,13 @@ class TriangularExecutor(ExecutorBase):
         Control the order execution process based on the execution strategy.
         """
         if self.status == RunnableStatus.RUNNING:
-            self.logger().info(f"--- Control task running")
             if self.hedge_mode and self.active_hedging_states:
                 await self.process_hedging_states()
-            await self.update_taker_prices()
-            await self.control_maker_order()
+            await self.calculate_taker_depth()
+            await self.update_maker_target_prices()
             await self.place_maker_order()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
-            self.logger().info(f"TriangularExecutor is shutting down.")
+            self.logger().info(f"TriangularExecutor is shutting down. Reason: {self.close_type.name}")
             self.stop()
 
     async def process_hedging_states(self):
@@ -141,14 +174,64 @@ class TriangularExecutor(ExecutorBase):
                 self.completion_timestamp = current_time
                 self.logger().info(f"All hedging states completed. Waiting {self.config.completion_wait_time}s before stopping executor.")
             elif current_time - self.completion_timestamp >= self.config.completion_wait_time:
-                # Wait time elapsed - stop executor
-                self.logger().info(f"Completion wait time elapsed. Stopping executor. PNL: {self.get_net_pnl_pct()}%")
-                self.close_type = CloseType.COMPLETED
+                # Wait time elapsed - check PnL and stop executor
+                pnl_pct = self.get_net_pnl_pct()
+                self.logger().info(f"Completion wait time elapsed. Stopping executor. PNL: {pnl_pct}%")
+                
+                # Check if PnL is below kill switch threshold
+                if pnl_pct < self.config.kill_switch_pnl_threshold:
+                    self.logger().warning(
+                        f"Executor PNL {pnl_pct}% is below kill switch threshold "
+                        f"{self.config.kill_switch_pnl_threshold}%. Marking as STOP_LOSS."
+                    )
+                    self.close_type = CloseType.STOP_LOSS
+                else:
+                    self.close_type = CloseType.COMPLETED
+                
                 self._status = RunnableStatus.SHUTTING_DOWN
 
-    async def update_taker_prices(self):
+    def _calculate_depth_for_side(self, depth_tracker: TakerPairDepthTracker, trading_pair: str,
+                                   is_buy: bool, volume: Decimal, use_quote_volume: bool = False):
         """
-        Update the prices of the maker and taker orders.
+        Helper method to calculate depth for a specific side.
+        
+        :param depth_tracker: The depth tracker to update
+        :param trading_pair: Trading pair to calculate depth for
+        :param is_buy: True for buy side, False for sell side
+        :param volume: Volume to calculate depth for
+        :param use_quote_volume: If True, use get_price_for_quote_volume, else get_price_for_volume
+        """
+        try:
+            if use_quote_volume:
+                result = self.connectors[self.config.connector_name].get_price_for_quote_volume(
+                    trading_pair=trading_pair,
+                    is_buy=is_buy,
+                    volume=volume
+                )
+            else:
+                result = self.connectors[self.config.connector_name].get_price_for_volume(
+                    trading_pair=trading_pair,
+                    is_buy=is_buy,
+                    volume=volume
+                )
+            
+            execution_price = result.result_price if result.result_price else Decimal("0")
+            best_price_type = PriceType.BestAsk if is_buy else PriceType.BestBid
+            best_price = self.get_price(self.config.connector_name, trading_pair, price_type=best_price_type)
+            
+            if execution_price > Decimal("0") and best_price > Decimal("0"):
+                if is_buy:
+                    depth_tracker.update_depth_buy(execution_price, best_price)
+                else:
+                    depth_tracker.update_depth_sell(execution_price, best_price)
+        except Exception as e:
+            side_name = "buy" if is_buy else "sell"
+            self.logger().warning(f"Error calculating {trading_pair} {side_name} depth: {e}")
+
+    async def calculate_taker_depth(self):
+        """
+        Calculate order book depth for taker pairs based on order amounts.
+        This runs continuously in the control loop to build depth history.
         """
         maker_bid_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestBid)
         maker_ask_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestAsk)
@@ -158,50 +241,104 @@ class TriangularExecutor(ExecutorBase):
             sell_amount_base = self.config.base_amount
             sell_amount_quote = sell_amount_base * maker_ask_price
 
-            sell_side_taker_1_price = await self.get_resulting_price_for_amount(self.config.connector_name, self.config.taker_1_pair, True, sell_amount_base)
-            sell_side_taker_2_price = await self.get_resulting_price_for_amount(self.config.connector_name, self.config.taker_2_pair, False, sell_amount_quote)
-            self.taker_result_buy_price = sell_side_taker_1_price / sell_side_taker_2_price
-            self.maker_target_sell_price = self.taker_result_buy_price * (1 + self.targer_profit_with_fees / Decimal("100"))
-            # self.logger().info(f"sell side taker_1_price: {sell_side_taker_1_price}")
-            # self.logger().info(f"sell side taker_2_price: {sell_side_taker_2_price}")
-            # self.logger().info(f"sell side target_profit_with_fees: {self.targer_profit_with_fees}")
-            # self.logger().info(f"sell side maker_target_sell_price: {self.maker_target_sell_price}")
+            # Calculate depth for taker_1 BUY (we buy on taker_1 when selling on maker)
+            self._calculate_depth_for_side(
+                self.taker_1_depth, self.config.taker_1_pair, is_buy=True,
+                volume=sell_amount_base, use_quote_volume=False
+            )
+
+            # Calculate depth for taker_2 SELL (we sell on taker_2 when selling on maker)
+            self._calculate_depth_for_side(
+                self.taker_2_depth, self.config.taker_2_pair, is_buy=False,
+                volume=sell_amount_quote, use_quote_volume=False
+            )
 
         # Buy order on maker sell on taker
         if self.place_buy_order:
             buy_amount_quote = self.config.quote_amount
-            buy_amount_base = buy_amount_quote / maker_bid_price
+            buy_amount_base = buy_amount_quote / maker_bid_price if maker_bid_price > Decimal("0") else Decimal("0")
 
-            buy_side_taker_1_price = await self.get_resulting_price_for_amount(self.config.connector_name, self.config.taker_1_pair, False, buy_amount_base)
-            buy_side_taker_2_price = await self.get_resulting_price_for_amount(self.config.connector_name, self.config.taker_2_pair, True, buy_amount_quote)
-            self.taker_result_sell_price = buy_side_taker_1_price / buy_side_taker_2_price
-            self.maker_target_buy_price = self.taker_result_sell_price * (1 - self.targer_profit_with_fees / Decimal("100"))
-            # self.logger().info(f"buy side taker_1_price: {buy_side_taker_1_price}")
-            # self.logger().info(f"buy side taker_2_price: {buy_side_taker_2_price}")
-            # self.logger().info(f"buy side target_profit_with_fees: {self.targer_profit_with_fees}")
-            # self.logger().info(f"buy side maker_target_buy_price: {self.maker_target_buy_price}")
+            # Calculate depth for taker_1 SELL (we sell on taker_1 when buying on maker)
+            if buy_amount_base > Decimal("0"):
+                self._calculate_depth_for_side(
+                    self.taker_1_depth, self.config.taker_1_pair, is_buy=False,
+                    volume=buy_amount_base, use_quote_volume=False
+                )
 
-    async def get_resulting_price_for_amount(self, connector: str, trading_pair: str, is_buy: bool,
-                                             order_amount: Decimal):
-        """Get the resulting price for a given amount"""
-        return await self.connectors[connector].get_quote_price(trading_pair, is_buy, order_amount)
+            # Calculate depth for taker_2 BUY (we buy on taker_2 when buying on maker)
+            self._calculate_depth_for_side(
+                self.taker_2_depth, self.config.taker_2_pair, is_buy=True,
+                volume=buy_amount_quote, use_quote_volume=False
+            )
+
+    async def update_maker_target_prices(self):
+        """
+        Update the maker target prices based on current taker result prices.
+        Taker result prices are calculated in event handler, this only calculates maker target prices.
+        This is called from control loop to update maker order prices when placing new orders.
+        """
+        # Only calculate maker target prices if we have valid taker result prices (from events)
+        # Sell order on maker buy on taker
+        if self.place_sell_order and self.taker_result_buy_price > Decimal("0"):
+            target_sell_price = self.taker_result_buy_price * (1 + self.target_profit_with_fees / Decimal("100"))
+            tick_size = self.trading_rules_maker.min_price_increment
+            # quantize the target sell price
+            self.maker_target_sell_price = target_sell_price // tick_size * tick_size
+            # self.logger().info(f"Maker target sell price: {self.maker_target_sell_price}, price before quantization: {target_sell_price}")
+            
+        # Buy order on maker sell on taker
+        if self.place_buy_order and self.taker_result_sell_price > Decimal("0"):
+            target_buy_price = self.taker_result_sell_price * (1 - self.target_profit_with_fees / Decimal("100"))
+            tick_size = self.trading_rules_maker.min_price_increment
+            # quantize the target buy price
+            self.maker_target_buy_price = target_buy_price // tick_size * tick_size
+            # self.logger().info(f"Maker target buy price: {self.maker_target_buy_price}, price before quantization: {target_buy_price}")
+
+    def write_price_snapshot(self, target_price: Decimal, order_id: str):
+        """
+        Write price snapshot to CSV file for slave synchronization.
+        Appends to file (header should already exist from on_start).
+        """
+        csv_path = self.CSV_SYNC_PATH
+        current_time = time.time()
+        current_minute = int(current_time) // 60
+        
+        with open(csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([current_time, current_minute, str(target_price), order_id])
 
     async def place_maker_order(self):
         """
-        Place the maker order.
+        Place the maker order. Only places at sync time (minute boundaries).
         """
         if self.place_buy_order and self.maker_bid_order is None and not self.hedge_mode:
+            if self.taker_result_sell_price == Decimal("0"):
+                self.logger().info(f"Waiting for taker result price (buy side)")
+                return
             current_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestAsk)
             amount_to_buy = self.config.quote_amount / current_price
             bid_order_id = await self.send_maker_order_to_exchange(side=TradeType.BUY, amount=amount_to_buy, price=self.maker_target_buy_price)
-            self.maker_bid_order = TrackedOrder(order_id=bid_order_id)
+            if bid_order_id:
+                self.maker_bid_order = TrackedOrder(order_id=bid_order_id)
+                self.last_buy_order_placed_minute = int(time.time()) // 60
+                self.last_maker_order_timestamp = time.time()
+                self.last_activity_timestamp = time.time()
+                # Write price snapshot to CSV for slave synchronization
+                self.write_price_snapshot(self.maker_target_buy_price, bid_order_id)
         if self.place_sell_order and self.maker_ask_order is None and not self.hedge_mode:
+            if self.taker_result_buy_price == Decimal("0"):
+                self.logger().info(f"Waiting for taker result price (sell side)")
+                return
             ask_order_id = await self.send_maker_order_to_exchange(side=TradeType.SELL, amount=self.config.base_amount, price=self.maker_target_sell_price)
-            self.maker_ask_order = TrackedOrder(order_id=ask_order_id)
+            if ask_order_id:
+                self.maker_ask_order = TrackedOrder(order_id=ask_order_id)
+                self.last_sell_order_placed_minute = int(time.time()) // 60
+                self.last_maker_order_timestamp = time.time()
+                self.last_activity_timestamp = time.time()
 
     async def send_maker_order_to_exchange(self, side: TradeType, amount: Decimal, price: Decimal):
         """
-        Create the maker bid order.
+        Create and send a maker limit order to the exchange.
         """
         order_candidate = OrderCandidate(
             trading_pair=self.config.maker_pair,
@@ -226,27 +363,6 @@ class TriangularExecutor(ExecutorBase):
         self.logger().info(f"Sent maker {side.name} order amount {amount} at price {price} on {self.config.maker_pair}, id = {order_id} ")
         return order_id
 
-    async def control_maker_order(self):
-        """
-        Control the maker order.
-        """
-        if self.maker_bid_order and self.maker_bid_order.order and self.maker_bid_order.order.is_open:
-            order_buy_price = self.maker_bid_order.order.price
-            potential_sell_price = self.taker_result_sell_price
-            self.check_and_cancel_maker_order(self.maker_bid_order, order_buy_price, potential_sell_price, "Bid")
-            self.calculate_current_profitability(order_buy_price, TradeType.BUY)
-
-        if self.maker_ask_order and self.maker_ask_order.order and self.maker_ask_order.order.is_open:
-            order_sell_price = self.maker_ask_order.order.price
-            potential_buy_price = self.taker_result_buy_price
-            self.check_and_cancel_maker_order(self.maker_ask_order, potential_buy_price, order_sell_price, "Ask")
-
-    def check_and_cancel_maker_order(self, order: TrackedOrder, buy_price: Decimal, sell_price: Decimal , type: str):
-        profitability = Decimal("100") * (sell_price - buy_price) / buy_price - self.total_fee_pct
-        # self.logger().info(f"{type} order {order.order_id} Trade profitability {profitability} on {self.config.maker_pair}")
-        if profitability < self.config.min_profit or profitability > self.config.max_profit:
-            self.logger().info(f"{type} order {order.order_id} Trade profitability {profitability} on {self.config.maker_pair} is out of profitability range. Cancelling order.")
-            self._strategy.cancel(self.config.connector_name, self.config.maker_pair, order.order_id)
 
     def process_order_created_event(self,
                                     event_tag: int,
@@ -274,9 +390,13 @@ class TriangularExecutor(ExecutorBase):
         if self.maker_bid_order and event.order_id == self.maker_bid_order.order_id:
             self.logger().info(f"Maker bid order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_bid_order = None
+            self.maker_bid_cancellation_in_progress = False
+            self.last_buy_order_placed_minute = None  # Reset to allow placing at next sync time
         if self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
             self.logger().info(f"Maker ask order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_ask_order = None
+            self.maker_ask_cancellation_in_progress = False
+            self.last_sell_order_placed_minute = None  # Reset to allow placing at next sync time
 
     def process_order_filled_event(self,
                                    event_tag: int,
@@ -291,6 +411,11 @@ class TriangularExecutor(ExecutorBase):
         if (self.maker_bid_order and event.order_id == self.maker_bid_order.order_id) or \
            (self.maker_ask_order and event.order_id == self.maker_ask_order.order_id):
             self.logger().info(f"Maker order {event.trade_type.name} filled, id = {event.order_id} on {event.trading_pair}")
+            # Reset cancellation flags
+            if event.order_id == self.maker_bid_order.order_id:
+                self.maker_bid_cancellation_in_progress = False
+            if event.order_id == self.maker_ask_order.order_id:
+                self.maker_ask_cancellation_in_progress = False
             if self.is_order_size_less_than_min(event.amount):
                 self.logger().info(f"Filled order amount {event.amount} is less than the minimum usdt amount. Continue")
             else:
@@ -317,14 +442,14 @@ class TriangularExecutor(ExecutorBase):
                     ),
                     created_timestamp=time.time(),
                 )
-                self.logger().info(f"Calculating current profitability after filled maker order {event.order_id}")
-                self.calculate_current_profitability(event.price, event.trade_type)
                 self.active_hedging_states.append(hedging_state)
                 self.logger().info(f"Created new HedgingState for maker order {event.order_id}")
 
                 # Place taker orders
                 self.place_taker_order(hedging_state.taker_1)
                 self.place_taker_order(hedging_state.taker_2)
+                self.last_taker_order_timestamp = time.time()
+                self.last_activity_timestamp = time.time()
                 self.cancel_maker_orders()
 
         # Taker order filled - find matching HedgingState
@@ -384,6 +509,8 @@ class TriangularExecutor(ExecutorBase):
         if order_id:
             taker_info.order_id = order_id
             taker_info.sent_timestamp = time.time()
+            self.last_taker_order_timestamp = time.time()
+            self.last_activity_timestamp = time.time()
         taker_info.trials += 1
 
         if log_retry:
@@ -396,7 +523,7 @@ class TriangularExecutor(ExecutorBase):
 
     def send_taker_order_to_exchange(self, trading_pair: str, side: TradeType, amount: Decimal):
         """
-        Create the maker bid order.
+        Create and send a taker market order to the exchange.
         """
         price = self.get_price(self.config.connector_name, trading_pair, price_type=PriceType.MidPrice)
         # order_candidate = OrderCandidate(
@@ -433,7 +560,7 @@ class TriangularExecutor(ExecutorBase):
         if self.maker_bid_order:
             self.logger().info(f"Cancelling maker bid order id = {self.maker_bid_order.order_id} on {self.config.maker_pair}")
             self._strategy.cancel(self.config.connector_name, self.config.maker_pair, self.maker_bid_order.order_id)
-            self.maker_bid_order = None
+            # self.maker_bid_order = None
         if self.maker_ask_order:
             self.logger().info(f"Cancelling maker ask order id = {self.maker_ask_order.order_id} on {self.config.maker_pair}")
             self._strategy.cancel(self.config.connector_name, self.config.maker_pair, self.maker_ask_order.order_id)
@@ -540,44 +667,162 @@ class TriangularExecutor(ExecutorBase):
         """
         return Decimal("0")
 
+    def get_custom_info(self) -> Dict:
+        """
+        Returns custom information about the executor including activity timestamps.
+        Used for monitoring executor activity and detecting stuck executors.
+        """
+        maker_pair = self.config.maker_pair
+        base, quote = maker_pair.split("-")
+        
+        return {
+            "maker_pair": maker_pair,
+            "base": base,
+            "quote": quote,
+            "hedge_mode": self.hedge_mode,
+            "last_maker_order_timestamp": self.last_maker_order_timestamp,
+            "last_taker_order_timestamp": self.last_taker_order_timestamp,
+            "last_activity_timestamp": self.last_activity_timestamp,
+        }
+
+    def _are_active_sides_ready(self) -> bool:
+        """
+        Check if depth is ready for the sides that are actually being used.
+        For sell side: taker_1 BUY, taker_2 SELL
+        For buy side: taker_1 SELL, taker_2 BUY
+        """
+        # Check sell side requirements
+        if self.place_sell_order:
+            if not (self.taker_1_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES) and 
+                    self.taker_2_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES)):
+                return False
+        
+        # Check buy side requirements
+        if self.place_buy_order:
+            if not (self.taker_1_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES) and 
+                    self.taker_2_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES)):
+                return False
+        
+        return True
+
     def process_best_bidask_event(self, event_tag: int, market, event: OrderBookBestBidAskEvent):
+        """
+        Handle best bid/ask events from taker pairs.
+        Updates depth tracker prices and recalculates triangular prices.
+        """
         if event.trading_pair != self.config.taker_1_pair and event.trading_pair != self.config.taker_2_pair:
             return
-        # self.logger().info(f"--- Received order book best bid/ask event for {event.trading_pair}: {event}")
+        
+        # Check if depth is ready for active sides before doing calculations
+        if not self._are_active_sides_ready():
+            return
+        
+        # Check if prices changed before updating and recalculating
+        prices_changed = False
         if event.trading_pair == self.config.taker_1_pair:
-            # self.logger().info(f"--- Received order book best bid/ask event for taker 1: {event}")
-            self.best_bidask_event_taker_1 = event
+            # Check if prices actually changed
+            prices_changed = (
+                self.taker_1_depth.best_bid_price != event.best_bid_price or
+                self.taker_1_depth.best_ask_price != event.best_ask_price
+            )
+            if prices_changed:
+                # self.logger().info(f"Bookticker: {event.trading_pair}, best_bid: {event.best_bid_price}, best_ask: {event.best_ask_price}, best_bid_size: {event.best_bid_size}, best_ask_size: {event.best_ask_size}")
+                self.taker_1_depth.update_best_prices(event.best_bid_price, event.best_ask_price)
+
         elif event.trading_pair == self.config.taker_2_pair:
-            # self.logger().info(f"--- Received  order book best bid/ask event for taker 2: {event}")
-            self.best_bidask_event_taker_2 = event
+            # Check if prices actually changed
+            prices_changed = (
+                self.taker_2_depth.best_bid_price != event.best_bid_price or
+                self.taker_2_depth.best_ask_price != event.best_ask_price
+            )
+            if prices_changed:
+                # self.logger().info(f"Bookticker: {event.trading_pair}, best_bid: {event.best_bid_price}, best_ask: {event.best_ask_price}, best_bid_size: {event.best_bid_size}, best_ask_size: {event.best_ask_size}")
+                self.taker_2_depth.update_best_prices(event.best_bid_price, event.best_ask_price)
+        
+        # Only recalculate if prices actually changed
+        if prices_changed:
+            self._recalculate_taker_prices()
+            self._check_maker_orders_profitability()
 
-    def calculate_current_profitability(self, price: Decimal, trade_type: TradeType):
-        hb_taker_1_ask_price = self.get_price(self.config.connector_name, self.config.taker_1_pair, price_type=PriceType.BestAsk)
-        hb_taker_1_bid_price = self.get_price(self.config.connector_name, self.config.taker_1_pair, price_type=PriceType.BestBid)
-        hb_taker_2_ask_price = self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=PriceType.BestAsk)
-        hb_taker_2_bid_price = self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=PriceType.BestBid)
+    def _recalculate_taker_prices(self):
+        """
+        Recalculate triangular taker result prices using event-based prices + depth.
+        This is the single source of truth for taker result prices.
+        """
+        # Sell order on maker buy on taker
+        if self.place_sell_order:
+            taker_1_target_buy = self.taker_1_depth.get_target_price_buy()
+            taker_2_target_sell = self.taker_2_depth.get_target_price_sell()
+            
+            if taker_1_target_buy > Decimal("0") and taker_2_target_sell > Decimal("0"):
+                self.taker_result_buy_price = taker_1_target_buy / taker_2_target_sell
 
-        self.logger().info(f"HBBOT prices: taker 1: {hb_taker_1_bid_price}, {hb_taker_1_ask_price}, taker 2: {hb_taker_2_bid_price}, {hb_taker_2_ask_price}")
+        # Buy order on maker sell on taker
+        if self.place_buy_order:
+            taker_1_target_sell = self.taker_1_depth.get_target_price_sell()
+            taker_2_target_buy = self.taker_2_depth.get_target_price_buy()
+            if taker_1_target_sell > Decimal("0") and taker_2_target_buy > Decimal("0"):
+                self.taker_result_sell_price = taker_1_target_sell / taker_2_target_buy
+                # self.logger().info(f"Taker result sell price: {self.taker_result_sell_price}, Taker 1 target sell price: {taker_1_target_sell}, Taker 2 target buy price: {taker_2_target_buy}")
 
-        if self.best_bidask_event_taker_1 and self.best_bidask_event_taker_2:
-            event_taker_1_ask_price = self.best_bidask_event_taker_1.best_ask_price
-            event_taker_1_bid_price = self.best_bidask_event_taker_1.best_bid_price
-            event_taker_2_ask_price = self.best_bidask_event_taker_2.best_ask_price
-            event_taker_2_bid_price = self.best_bidask_event_taker_2.best_bid_price
+    def _check_maker_orders_profitability(self):
+        """
+        Check profitability of all existing maker orders and cancel if out of range.
+        """
+        # Check sell side maker order (ask order)
+        if self.place_sell_order and self.taker_result_buy_price > Decimal("0"):
+            self._validate_and_cancel_maker_order(
+                self.maker_ask_order, TradeType.SELL, 
+                self.taker_result_buy_price, "Ask"
+            )
 
-            self.logger().info(f"EVENT prices: taker 1: {event_taker_1_bid_price}, {event_taker_1_ask_price}, taker 2: {event_taker_2_bid_price}, {event_taker_2_ask_price}")
+        # Check buy side maker order (bid order)
+        if self.place_buy_order and self.taker_result_sell_price > Decimal("0"):
+            self._validate_and_cancel_maker_order(
+                self.maker_bid_order, TradeType.BUY,
+                self.taker_result_sell_price, "Bid"
+            )
 
-            if trade_type == TradeType.BUY:
-                self.calculate_profit(price, event_taker_1_bid_price / event_taker_2_ask_price, "EVENT")
-            else:
-                self.calculate_profit(event_taker_1_ask_price / event_taker_2_bid_price, price, "EVENT")
-
+    def _validate_and_cancel_maker_order(self, order: Optional[TrackedOrder], trade_type: TradeType,
+                                        taker_result_price: Decimal, order_type: str):
+        """
+        Validate profitability of a single maker order and cancel if out of range.
+        
+        :param order: The tracked order to check
+        :param trade_type: TradeType.BUY or TradeType.SELL
+        :param taker_result_price: The calculated taker result price
+        :param order_type: String identifier for logging ("Bid" or "Ask")
+        """
+        if not order or not order.order or not order.order.is_open:
+            return
+        
+        # Check if cancellation is already in progress to prevent duplicate attempts
+        cancellation_flag = self.maker_bid_cancellation_in_progress if trade_type == TradeType.BUY else self.maker_ask_cancellation_in_progress
+        if cancellation_flag:
+            self.logger().info(f"{order_type} order {order.order_id} cancellation already in progress, skipping")
+            return
+        
+        order_price = order.order.price
+        
         if trade_type == TradeType.BUY:
-            self.calculate_profit(price, hb_taker_1_bid_price / hb_taker_2_ask_price, "HBBOT")
-        else:
-            self.calculate_profit(hb_taker_1_ask_price / hb_taker_2_bid_price, price, "HBBOT")
+            self.check_and_cancel_maker_order(order, order_price, taker_result_price, order_type)
+        else:  # SELL
+            self.check_and_cancel_maker_order(order, taker_result_price, order_price, order_type)
 
-    def calculate_profit(self, buy_price: Decimal, sell_price: Decimal, type: str):
-        profitability = Decimal("100") * (sell_price - buy_price) / buy_price - self.total_fee_pct
-        self.logger().info(f"Profitability for {type} type: {profitability}")
-        return profitability
+    def check_and_cancel_maker_order(self, order: TrackedOrder, buy_price: Decimal, sell_price: Decimal , type: str):
+        profitability = round(Decimal("100") * (sell_price - buy_price) / buy_price - self.total_fee_pct, 3)    
+        # self.logger().info(f"{type} {self.config.maker_pair} {order.order_id} profitability {profitability}")
+        if profitability < self.config.min_profit or profitability > self.config.max_profit:
+            # Double-check order is still open before cancelling
+            if not order.order or not order.order.is_open:
+                self.logger().info(f"{type} order {order.order_id} is no longer open, skipping cancellation")
+                return
+            
+            # Set cancellation flag to prevent duplicate attempts
+            if type == "Bid":
+                self.maker_bid_cancellation_in_progress = True
+            else:
+                self.maker_ask_cancellation_in_progress = True
+            
+            self.logger().info(f"{type} order {order.order_id} profitability {profitability} on {self.config.maker_pair} is out of profitability range. Cancelling order.")
+            self._strategy.cancel(self.config.connector_name, self.config.maker_pair, order.order_id)
