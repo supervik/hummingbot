@@ -97,14 +97,17 @@ class TriangularExecutor(ExecutorBase):
         self.maker_ask_order = None
         self.maker_bid_cancellation_in_progress = False
         self.maker_ask_cancellation_in_progress = False
-        self.last_buy_order_placed_minute: Optional[int] = None
-        self.last_sell_order_placed_minute: Optional[int] = None
+        # Track all active maker order IDs to handle race conditions (cancel + fill)
+        self.current_maker_order_ids = set()
         self.usdt_pair = config.taker_1_pair
         self.hedge_mode = False
         self.active_hedging_states: List[HedgingState] = []
         self.completion_timestamp: Optional[float] = None
         self.place_buy_order = False if self.config.quote_amount == Decimal("0") else True
         self.place_sell_order = False if self.config.base_amount == Decimal("0") else True
+        # Hedge latency metrics (per-executor, single-cycle)
+        self.delay_server: Optional[float] = None
+        self.delay_exchange: Optional[float] = None
         
         # Track activity timestamps for stuck executor detection
         self.last_maker_order_timestamp: Optional[float] = None
@@ -206,12 +209,30 @@ class TriangularExecutor(ExecutorBase):
         else:
             # All states complete
             if self.completion_timestamp is None:
-                # First time all complete - set timestamp
+                # First time all complete - compute hedge latency metrics and set timestamp
+                try:
+                    # Use the latest hedging state by creation time (per executor cycle)
+                    latest_state = max(self.active_hedging_states, key=lambda s: s.created_timestamp)
+
+                    # Server-side hedge delay (maker fill to last taker fill, as seen by our process)
+                    if latest_state.maker_fill_server_ts is not None and latest_state.last_taker_fill_server_ts is not None:
+                        self.delay_server = latest_state.last_taker_fill_server_ts - latest_state.maker_fill_server_ts
+
+                    # Exchange-side hedge delay based on TradeUpdate.fill_timestamp
+                    if (latest_state.maker_fill_exchange_ts is not None and
+                            latest_state.last_taker_fill_exchange_ts is not None):
+                        self.delay_exchange = (
+                            latest_state.last_taker_fill_exchange_ts - latest_state.maker_fill_exchange_ts
+                        )
+                except Exception as e:
+                    # Never fail the executor due to metrics calculation
+                    self.notify("warning", f"Error computing hedge latency metrics: {e}")
+
                 self.completion_timestamp = current_time
                 self.notify("info", f"All hedging states completed. Waiting {self.config.completion_wait_time}s before stopping executor.")
             elif current_time - self.completion_timestamp >= self.config.completion_wait_time:
                 # Wait time elapsed - check PnL and stop executor
-                pnl_pct = self.get_net_pnl_pct()
+                pnl_pct = round(self.get_net_pnl_pct(),2)
                 self.notify("info", f"Completion wait time elapsed. Stopping executor. PNL: {pnl_pct}%")
                 
                 # Check if PnL is below kill switch threshold
@@ -219,13 +240,13 @@ class TriangularExecutor(ExecutorBase):
                     self.close_type = CloseType.STOP_LOSS
                     self.notify(
                         "warning",
-                        f"STOP_LOSS triggered. PNL {pnl_pct}% is below threshold "
+                        f"----- !!!!!! STOP_LOSS triggered. PNL {pnl_pct}% is below threshold "
                         f"{self.config.kill_switch_pnl_threshold}%.",
                         to_app=True,
                     )
                 else:
                     self.close_type = CloseType.COMPLETED
-                    self.notify("info", f"Executor completed. Final PnL: {pnl_pct}%.", to_app=True)
+                    self.notify("info", f"------ Executor completed. Final PnL: {pnl_pct}%.", to_app=True)
                 
                 self._status = RunnableStatus.SHUTTING_DOWN
 
@@ -266,6 +287,21 @@ class TriangularExecutor(ExecutorBase):
         except Exception as e:
             side_name = "buy" if is_buy else "sell"
             self.notify("warning", f"Error calculating {trading_pair} {side_name} depth: {e}")
+
+    def _get_last_fill_exchange_timestamp(self, order_id: str) -> Optional[float]:
+        """
+        Helper to fetch the latest exchange-side fill timestamp for a given order id
+        using TradeUpdate.fill_timestamp from the in-flight order.
+        Metrics-only: failures are swallowed and reported as None.
+        """
+        try:
+            in_flight = self.get_in_flight_order(self.config.connector_name, order_id)
+            if in_flight is not None and in_flight.order_fills:
+                return max(trade.fill_timestamp for trade in in_flight.order_fills.values())
+        except Exception:
+            # Metrics-only path; ignore failures
+            pass
+        return None
 
     async def calculate_taker_depth(self):
         """
@@ -359,7 +395,7 @@ class TriangularExecutor(ExecutorBase):
             bid_order_id = await self.send_maker_order_to_exchange(side=TradeType.BUY, amount=amount_to_buy, price=self.maker_target_buy_price)
             if bid_order_id:
                 self.maker_bid_order = TrackedOrder(order_id=bid_order_id)
-                self.last_buy_order_placed_minute = int(time.time()) // 60
+                self.current_maker_order_ids.add(bid_order_id)
                 self.last_maker_order_timestamp = time.time()
                 self.last_activity_timestamp = time.time()
                 #4/4 Write price snapshot to CSV for slave synchronization
@@ -371,7 +407,7 @@ class TriangularExecutor(ExecutorBase):
             ask_order_id = await self.send_maker_order_to_exchange(side=TradeType.SELL, amount=self.config.base_amount, price=self.maker_target_sell_price)
             if ask_order_id:
                 self.maker_ask_order = TrackedOrder(order_id=ask_order_id)
-                self.last_sell_order_placed_minute = int(time.time()) // 60
+                self.current_maker_order_ids.add(ask_order_id)
                 self.last_maker_order_timestamp = time.time()
                 self.last_activity_timestamp = time.time()
 
@@ -425,17 +461,66 @@ class TriangularExecutor(ExecutorBase):
         """
         Handles order cancelled events from the exchange.
         Clears the maker order tracking when the maker order is cancelled.
+        
+        IMPORTANT: We do NOT remove order_id from current_maker_order_ids here!
+        This is to handle the race condition where cancellation arrives before a fill event.
+        The fill may have happened on the exchange before cancellation, but the fill event
+        arrives to our system after the cancel event. We need to keep the order_id tracked
+        so we can still start a hedge for that fill.
         """
         if self.maker_bid_order and event.order_id == self.maker_bid_order.order_id:
             self.notify("info", f"Maker bid order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_bid_order = None
             self.maker_bid_cancellation_in_progress = False
-            self.last_buy_order_placed_minute = None  # Reset to allow placing at next sync time
-        if self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
+            # Do NOT remove from current_maker_order_ids - late fills may still arrive
+        elif self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
             self.notify("info", f"Maker ask order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_ask_order = None
             self.maker_ask_cancellation_in_progress = False
-            self.last_sell_order_placed_minute = None  # Reset to allow placing at next sync time
+            # Do NOT remove from current_maker_order_ids - late fills may still arrive
+
+    def _handle_failed_maker_order(self, order_type: str, order_id: str):
+        """
+        Helper method to handle failed maker order cleanup.
+        
+        :param order_type: "bid" or "ask"
+        :param order_id: The failed order ID
+        """
+        self.notify(
+            "warning",
+            f"Maker {order_type} order {order_id} failed to be placed on {self.config.maker_pair}",
+            to_app=True,
+        )
+        # Cancel the order if it exists
+        try:
+            self._strategy.cancel(self.config.connector_name, self.config.maker_pair, order_id)
+        except Exception:
+            pass  # Order may not exist, ignore cancellation errors
+        
+        # Clear order tracking and reset cancellation flag
+        if order_type == "bid":
+            self.maker_bid_order = None
+            self.maker_bid_cancellation_in_progress = False
+        else:  # ask
+            self.maker_ask_order = None
+            self.maker_ask_cancellation_in_progress = False
+        
+        # Remove from tracking set since this order is truly dead
+        self.current_maker_order_ids.discard(order_id)
+
+    def process_order_failed_event(self,
+                                   event_tag: int,
+                                   market: ConnectorBase,
+                                   event: MarketOrderFailureEvent):
+        """
+        Handles order failed events from the exchange.
+        Clears the maker order tracking so new orders can be placed.
+        """
+        # Check if this is a maker order failure
+        if self.maker_bid_order and event.order_id == self.maker_bid_order.order_id:
+            self._handle_failed_maker_order("bid", event.order_id)
+        elif self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
+            self._handle_failed_maker_order("ask", event.order_id)
 
     def process_order_filled_event(self,
                                    event_tag: int,
@@ -445,19 +530,33 @@ class TriangularExecutor(ExecutorBase):
         Handles order filled events from the exchange.
         When maker order is filled, creates HedgingState and places taker orders.
         When taker orders are filled, tracks them in the corresponding HedgingState.
+        
+        Uses current_maker_order_ids set to handle race condition where cancellation
+        event arrives before fill event (order object may be None but ID still tracked).
         """
-        # Maker order filled
-        if (self.maker_bid_order and event.order_id == self.maker_bid_order.order_id) or \
-           (self.maker_ask_order and event.order_id == self.maker_ask_order.order_id):
+        # Maker order filled - check trading pair, then check if order ID is tracked
+        # This handles race condition: cancel event arrives first, sets order to None,
+        # then fill event arrives and we still need to hedge the partial fill
+        is_maker_fill = (
+            event.trading_pair == self.config.maker_pair and
+            event.order_id in self.current_maker_order_ids
+        )
+        
+        if is_maker_fill:
             self.notify(
                 "info",
-                f"Maker {event.trade_type.name} filled {event.amount} at {event.price} on {event.trading_pair}.",
+                f"Maker {event.trade_type.name} {event.amount} {event.trading_pair} filled at {event.price}",
                 to_app=True,
             )
-            # Reset cancellation flags
-            if event.order_id == self.maker_bid_order.order_id:
+            # Reset cancellation flags - determine which side based on order_id
+            # (order object might be None if cancellation arrived first)
+            if self.maker_bid_order and event.order_id == self.maker_bid_order.order_id:
                 self.maker_bid_cancellation_in_progress = False
-            if event.order_id == self.maker_ask_order.order_id:
+            elif self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
+                self.maker_ask_cancellation_in_progress = False
+            else:
+                # Order was already cancelled (object is None), reset both flags to be safe
+                self.maker_bid_cancellation_in_progress = False
                 self.maker_ask_cancellation_in_progress = False
             if self.is_order_size_less_than_min(event.amount):
                 self.notify("info", f"Filled order amount {event.amount} is less than the minimum usdt amount. Continue")
@@ -470,6 +569,9 @@ class TriangularExecutor(ExecutorBase):
                 taker_1_side = TradeType.SELL if event.trade_type == TradeType.BUY else TradeType.BUY
                 taker_2_side = event.trade_type
                 taker_2_amount = event.amount * event.price
+
+                # Compute exchange-side maker fill timestamp from in-flight order fills
+                maker_fill_exchange_ts: Optional[float] = self._get_last_fill_exchange_timestamp(event.order_id)
 
                 hedging_state = HedgingState(
                     maker_fill=event,
@@ -484,6 +586,8 @@ class TriangularExecutor(ExecutorBase):
                         amount=taker_2_amount,
                     ),
                     created_timestamp=time.time(),
+                    maker_fill_server_ts=time.time(),
+                    maker_fill_exchange_ts=maker_fill_exchange_ts,
                 )
                 self.active_hedging_states.append(hedging_state)
                 self.notify("info", f"Created new HedgingState for maker order {event.order_id}")
@@ -500,17 +604,29 @@ class TriangularExecutor(ExecutorBase):
             for state in self.active_hedging_states:
                 if event.order_id == state.taker_1.order_id:
                     state.taker_1.filled_events.append(event)
+                    # Update last taker fill timestamps for hedge latency (per cycle)
+                    now = time.time()
+                    state.last_taker_fill_server_ts = now
+                    last_exch_ts = self._get_last_fill_exchange_timestamp(event.order_id)
+                    if last_exch_ts is not None:
+                        state.last_taker_fill_exchange_ts = last_exch_ts
                     self.notify(
                         "info",
-                        f"Taker 1 order {event.trade_type.name} filled, id = {event.order_id} on {event.trading_pair}, amount = {event.amount}",
+                        f"Taker 1 {event.trade_type.name} {event.amount} {event.trading_pair} filled at {event.price}",
                         to_app=True,
                     )
                     break
                 elif event.order_id == state.taker_2.order_id:
                     state.taker_2.filled_events.append(event)
+                    # Update last taker fill timestamps for hedge latency (per cycle)
+                    now = time.time()
+                    state.last_taker_fill_server_ts = now
+                    last_exch_ts = self._get_last_fill_exchange_timestamp(event.order_id)
+                    if last_exch_ts is not None:
+                        state.last_taker_fill_exchange_ts = last_exch_ts
                     self.notify(
                         "info",
-                        f"Taker 2 order {event.trade_type.name} filled, id = {event.order_id} on {event.trading_pair}, amount = {event.amount}",
+                        f"Taker 2 {event.trade_type.name} {event.amount} {event.trading_pair} filled at {event.price}",
                         to_app=True,
                     )
                     break
@@ -696,6 +812,22 @@ class TriangularExecutor(ExecutorBase):
         :return: The net profit and loss in quote currency.
         """
         # Sum maker amounts from all completed hedging states
+        # total_maker_amount = Decimal("0")
+        # for state in self.active_hedging_states:
+        #     if state.is_complete():
+        #         total_maker_amount += state.maker_fill.amount
+
+        # if not total_maker_amount:
+        #     return Decimal("0")
+
+        # conversion_rate = self.get_price(self.config.connector_name, self.usdt_pair, price_type=PriceType.MidPrice)
+        # total_maker_amount_in_usdt = total_maker_amount * conversion_rate
+        pnl = self.get_net_pnl_pct() / Decimal("100")
+
+        return self.filled_amount_quote * pnl
+
+    @property
+    def filled_amount_quote(self):
         total_maker_amount = Decimal("0")
         for state in self.active_hedging_states:
             if state.is_complete():
@@ -705,10 +837,8 @@ class TriangularExecutor(ExecutorBase):
             return Decimal("0")
 
         conversion_rate = self.get_price(self.config.connector_name, self.usdt_pair, price_type=PriceType.MidPrice)
-        total_maker_amount_in_usdt = total_maker_amount * conversion_rate
-        pnl = self.get_net_pnl_pct() / Decimal("100")
 
-        return total_maker_amount_in_usdt * pnl
+        return total_maker_amount * conversion_rate
 
     def get_cum_fees_quote(self) -> Decimal:
         """
@@ -718,23 +848,6 @@ class TriangularExecutor(ExecutorBase):
         """
         return Decimal("0")
 
-    def get_custom_info(self) -> Dict:
-        """
-        Returns custom information about the executor including activity timestamps.
-        Used for monitoring executor activity and detecting stuck executors.
-        """
-        maker_pair = self.config.maker_pair
-        base, quote = maker_pair.split("-")
-        
-        return {
-            "maker_pair": maker_pair,
-            "base": base,
-            "quote": quote,
-            "hedge_mode": self.hedge_mode,
-            "last_maker_order_timestamp": self.last_maker_order_timestamp,
-            "last_taker_order_timestamp": self.last_taker_order_timestamp,
-            "last_activity_timestamp": self.last_activity_timestamp,
-        }
 
     def _are_active_sides_ready(self) -> bool:
         """
@@ -821,14 +934,14 @@ class TriangularExecutor(ExecutorBase):
         Check profitability of all existing maker orders and cancel if out of range.
         """
         # Check sell side maker order (ask order)
-        if self.place_sell_order and self.taker_result_buy_price > Decimal("0"):
+        if self.place_sell_order and self.taker_result_buy_price > Decimal("0") and self.maker_ask_order:
             self._validate_and_cancel_maker_order(
                 self.maker_ask_order, TradeType.SELL, 
                 self.taker_result_buy_price, "Ask"
             )
 
         # Check buy side maker order (bid order)
-        if self.place_buy_order and self.taker_result_sell_price > Decimal("0"):
+        if self.place_buy_order and self.taker_result_sell_price > Decimal("0") and self.maker_bid_order:
             self._validate_and_cancel_maker_order(
                 self.maker_bid_order, TradeType.BUY,
                 self.taker_result_sell_price, "Bid"
@@ -877,3 +990,23 @@ class TriangularExecutor(ExecutorBase):
             
             self.notify("info", f"{type} order {order.order_id} profitability {profitability} on {self.config.maker_pair} is out of profitability range. Cancelling order.")
             self._strategy.cancel(self.config.connector_name, self.config.maker_pair, order.order_id)
+
+    def get_custom_info(self) -> Dict:
+        """
+        Returns custom information about the executor including activity timestamps.
+        Used for monitoring executor activity and detecting stuck executors.
+        """
+        maker_pair = self.config.maker_pair
+        base, quote = maker_pair.split("-")
+        
+        return {
+            "maker_pair": maker_pair,
+            "base": base,
+            "quote": quote,
+            "hedge_mode": self.hedge_mode,
+            "last_maker_order_timestamp": self.last_maker_order_timestamp,
+            "last_taker_order_timestamp": self.last_taker_order_timestamp,
+            "last_activity_timestamp": self.last_activity_timestamp,
+            "delay_server": self.delay_server,
+            "delay_exchange": self.delay_exchange,
+        }

@@ -107,6 +107,11 @@ class HedgingState(BaseModel):
     taker_1: TakerOrderInfo
     taker_2: TakerOrderInfo
     created_timestamp: float
+    # Internal timing fields for hedge latency analysis (per executor cycle)
+    maker_fill_server_ts: Optional[float] = None
+    last_taker_fill_server_ts: Optional[float] = None
+    maker_fill_exchange_ts: Optional[float] = None
+    last_taker_fill_exchange_ts: Optional[float] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def is_complete(self) -> bool:

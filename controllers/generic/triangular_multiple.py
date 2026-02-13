@@ -20,6 +20,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
     triangles: List[str] = ["ATOM-BTC ATOM-USDT BTC-USDT", "XRP-BTC XRP-USDT BTC-USDT"]
     balances: Dict[str, Decimal] = {"ATOM": Decimal("5"), "BTC": Decimal("0.0002"), "XRP": Decimal("1000")}
     rebalance_asset: str = "USDT"
+    fee_asset: Optional[str] = None  # Optional fee asset (e.g., BNB, KCS) to be rebalanced along with base/quote
 
     # profitabilty parameters
     min_usdt: Decimal = Decimal("10")
@@ -35,6 +36,12 @@ class TriangularMultipleConfig(ControllerConfigBase):
             # First 3 tokens are always the pairs
             for pair in pairs[:3]:
                 markets = markets.add_or_update(self.connector_name, pair)
+        
+        # Add fee asset trading pair if configured
+        if self.fee_asset:
+            fee_pair = f"{self.fee_asset}-{self.rebalance_asset}"
+            markets = markets.add_or_update(self.connector_name, fee_pair)
+        
         return markets
 
     def _parse_triangle_string(self, triangle_str: str) -> Dict[str, Union[str, bool, Optional[Decimal]]]:
@@ -129,7 +136,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
         for parsed in self._parsed_triangles():
             maker_pair = parsed["maker_pair"]
             base, quote = maker_pair.split("-")
-            
+
             base_amount = Decimal("0") if parsed["buy_only"] else \
                 self._allocate_amount(self.balances.get(base, Decimal("0")), base_usage.get(base, 0))
             quote_amount = Decimal("0") if parsed["sell_only"] else \
@@ -279,11 +286,15 @@ class TriangularMultiple(ControllerBase):
                 self.ready_for_new_triangle[maker_pair] = False
             else:
                 # Not ready - executor stopped, need rebalance first
-                # Create triangle-specific rebalance executor (only check base and quote assets)
+                # Create triangle-specific rebalance executor (check base, quote, and optionally fee asset)
                 triangle_balances = {
                     base: self.config.balances.get(base, Decimal("0")),
                     quote: self.config.balances.get(quote, Decimal("0"))
                 }
+                
+                # Add fee asset if configured
+                if self.config.fee_asset and self.config.fee_asset in self.config.balances:
+                    triangle_balances[self.config.fee_asset] = self.config.balances[self.config.fee_asset]
                 
                 self.logger().info(f"Executor stopped for triangle {maker_pair}, creating rebalance executor for assets: {list(triangle_balances.keys())}")
                 rebalance_executor_config = RebalanceExecutorConfig(

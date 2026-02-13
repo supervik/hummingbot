@@ -6,6 +6,7 @@ import pandas as pd
 from pydantic import Field
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.clock import Clock
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -65,22 +66,42 @@ class VikV2WithControllers(StrategyV2Base):
         if self.config.kill_switch_enabled:
             self.check_balance_kill_switch()
 
-    # @staticmethod
-    # def executors_info_to_df(executors_info: List[ExecutorInfo]) -> pd.DataFrame:
-    #     """
-    #     Convert a list of executor handler info to a dataframe.
-    #     """
-    #     df = pd.DataFrame([ei.to_dict() for ei in executors_info])
-    #     # Convert the enum values to integers
-    #     df['status'] = df['status'].apply(lambda x: x.value)
-
-    #     # Sort the DataFrame
-    #     df.sort_values(by='status', ascending=True, inplace=True)
-
-    #     # Convert back to string representation without enum prefix
-    #     df['status'] = df['status'].apply(lambda x: RunnableStatus(x).name)
-    #     df['close_type'] = df['close_type'].apply(lambda x: CloseType(x).name if x is not None else None)
-    #     return df
+    @staticmethod
+    def executors_info_to_df(executors_info: List[ExecutorInfo]) -> pd.DataFrame:
+        """
+        Convert a list of executor handler info to a dataframe.
+        """
+        df = pd.DataFrame([ei.to_dict() for ei in executors_info])
+        
+        # Convert enum values
+        df['status'] = df['status'].apply(lambda x: x.value)
+        df.sort_values(by='status', ascending=True, inplace=True)
+        df['status'] = df['status'].apply(lambda x: RunnableStatus(x).name)
+        df['close_type'] = df['close_type'].apply(lambda x: CloseType(x).name if x is not None else None)
+        
+        # Extract custom_info fields for triangular executors
+        custom_info_fields = ['maker_pair', 'delay_server', 'delay_exchange']
+        for field in custom_info_fields:
+            df[field] = df['custom_info'].apply(
+                lambda x: x.get(field, None) if isinstance(x, dict) else None
+            )
+        
+        # Format numeric columns: {column: (decimals, suffix)}
+        format_specs = {
+            'net_pnl_pct': (2, '%'),
+            'net_pnl_quote': (2, ''),
+            'filled_amount_quote': (2, ''),
+            'delay_server': (3, ''),
+            'delay_exchange': (3, ''),
+        }
+        
+        for column, (decimals, suffix) in format_specs.items():
+            if column in df.columns:
+                df[column] = df[column].apply(
+                    lambda x: f"{float(x):.{decimals}f}{suffix}" if x is not None else None
+                )
+        
+        return df
         
     def create_actions_proposal(self) -> List[CreateExecutorAction]:
         return []
@@ -186,3 +207,127 @@ class VikV2WithControllers(StrategyV2Base):
         else:
             # Drawdown is within acceptable range, reset counter
             self.kill_switch_counter = 0
+    
+    def format_status(self) -> str:
+        """
+        Override format_status to include maker_pair column in executor table.
+        """
+        if not self.ready_to_trade:
+            return "Market connectors are not ready."
+
+        lines = []
+        warning_lines = []
+        warning_lines.extend(self.network_warning(self.get_market_trading_pair_tuples()))
+
+        # Basic account info
+        balance_df = self.get_balance_df()
+        lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
+
+        try:
+            df = self.active_orders_df()
+            lines.extend(["", "  Orders:"] + ["    " + line for line in df.to_string(index=False).split("\n")])
+        except ValueError:
+            lines.extend(["", "  No active maker orders."])
+
+        # Controller sections
+        performance_data = []
+
+        for controller_id, controller in self.controllers.items():
+            lines.append(f"\n{'=' * 60}")
+            lines.append(f"Controller: {controller_id}")
+            lines.append(f"{'=' * 60}")
+
+            # Controller status
+            lines.extend(controller.to_format_status())
+
+            # Last 20 executors table
+            executors_list = self.get_executors_by_controller(controller_id)
+            if executors_list:
+                lines.append("\n  Recent Executors (Last 30):")
+                # Sort by timestamp and take last 30
+                recent_executors = sorted(executors_list, key=lambda x: x.timestamp, reverse=True)[:30]
+                executors_df = self.executors_info_to_df(recent_executors)
+                if not executors_df.empty:
+                    executors_df["age"] = self.current_timestamp - executors_df["timestamp"]
+                    # Include maker_pair and hedge latency metrics (if available) in the columns list
+                    executor_columns = [
+                        "type",
+                        "maker_pair",
+                        "side",
+                        "status",
+                        "net_pnl_pct",
+                        "net_pnl_quote",
+                        "filled_amount_quote",
+                        "delay_server",
+                        "delay_exchange",
+                        "is_trading",
+                        "close_type",
+                        "age",
+                    ]
+                    available_columns = [col for col in executor_columns if col in executors_df.columns]
+                    lines.append(format_df_for_printout(executors_df[available_columns],
+                                                        table_format="psql", index=False))
+            else:
+                lines.append("  No executors found.")
+
+            # Positions table
+            positions = self.get_positions_by_controller(controller_id)
+            if positions:
+                lines.append("\n  Positions Held:")
+                positions_data = []
+                for pos in positions:
+                    positions_data.append({
+                        "Connector": pos.connector_name,
+                        "Trading Pair": pos.trading_pair,
+                        "Side": pos.side.name,
+                        "Amount": f"{pos.amount:.4f}",
+                        "Value (USD)": f"${pos.amount * pos.breakeven_price:.2f}",
+                        "Breakeven Price": f"{pos.breakeven_price:.6f}",
+                        "Unrealized PnL": f"${pos.unrealized_pnl_quote:+.2f}",
+                        "Realized PnL": f"${pos.realized_pnl_quote:+.2f}",
+                        "Fees": f"${pos.cum_fees_quote:.2f}"
+                    })
+                positions_df = pd.DataFrame(positions_data)
+                lines.append(format_df_for_printout(positions_df, table_format="psql", index=False))
+            else:
+                lines.append("  No positions held.")
+
+            # Collect performance data for summary table
+            performance_report = self.get_performance_report(controller_id)
+            if performance_report:
+                performance_data.append({
+                    "Controller": controller_id,
+                    "Realized PnL": f"${performance_report.realized_pnl_quote:.2f}",
+                    "Unrealized PnL": f"${performance_report.unrealized_pnl_quote:.2f}",
+                    "Global PnL": f"${performance_report.global_pnl_quote:.2f}",
+                    "Global PnL %": f"{performance_report.global_pnl_pct:.2f}%",
+                    "Volume Traded": f"${performance_report.volume_traded:.2f}"
+                })
+
+        # Performance summary table
+        if performance_data:
+            lines.append(f"\n{'=' * 80}")
+            lines.append("PERFORMANCE SUMMARY")
+            lines.append(f"{'=' * 80}")
+
+            # Calculate global totals
+            global_realized = sum(Decimal(p["Realized PnL"].replace("$", "")) for p in performance_data)
+            global_unrealized = sum(Decimal(p["Unrealized PnL"].replace("$", "")) for p in performance_data)
+            global_total = global_realized + global_unrealized
+            global_volume = sum(Decimal(p["Volume Traded"].replace("$", "")) for p in performance_data)
+            global_pnl_pct = (global_total / global_volume) * 100 if global_volume > 0 else Decimal(0)
+
+            # Add global row
+            performance_data.append({
+                "Controller": "GLOBAL TOTAL",
+                "Realized PnL": f"${global_realized:.2f}",
+                "Unrealized PnL": f"${global_unrealized:.2f}",
+                "Global PnL": f"${global_total:.2f}",
+                "Global PnL %": f"{global_pnl_pct:.2f}%",
+                "Volume Traded": f"${global_volume:.2f}"
+            })
+
+            performance_df = pd.DataFrame(performance_data)
+            lines.append(format_df_for_printout(performance_df, table_format="psql", index=False))
+
+        return "\n".join(lines)
