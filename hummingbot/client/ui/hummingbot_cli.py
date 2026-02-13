@@ -96,7 +96,7 @@ class HummingbotCLI(PubSub):
         loop = asyncio.get_event_loop()
         loop.create_task(start_timer(self.timer))
         loop.create_task(start_process_monitor(self.process_usage))
-        loop.create_task(start_trade_monitor(self.trade_monitor))
+        # loop.create_task(start_trade_monitor(self.trade_monitor))  # Disabled to avoid connector name errors and neccessary database requests
 
     def did_start_ui(self):
         self._stdout_redirect_context.enter_context(patch_stdout(log_field=self.log_field))

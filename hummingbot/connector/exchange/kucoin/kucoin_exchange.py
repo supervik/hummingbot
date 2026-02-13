@@ -274,7 +274,7 @@ class KucoinExchange(ExchangePyBase):
                             trade_id=execution_data["tradeId"],
                             client_order_id=client_order_id,
                             exchange_order_id=execution_data["orderId"],
-                            trading_pair=updatable_order.trading_pair,
+                            trading_pair=fillable_order.trading_pair,  # Use fillable_order instead of updatable_order
                             fee=fee,
                             fill_base_amount=execute_amount_diff,
                             fill_quote_amount=execute_amount_diff * execute_price,
