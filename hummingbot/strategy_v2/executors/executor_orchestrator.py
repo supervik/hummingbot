@@ -309,10 +309,9 @@ class ExecutorOrchestrator:
                     for executor in executors_list]):
                 continue
             await asyncio.sleep(2.0)
-        # Store all positions
+        # Store all positions and executors
         self.store_all_positions()
-        # Clear executors and trigger garbage collection
-        self.active_executors.clear()
+        self.store_all_executors()
 
     def store_all_positions(self):
         """
@@ -355,7 +354,8 @@ class ExecutorOrchestrator:
         for controller_id, executors_list in self.active_executors.items():
             for executor in executors_list:
                 # Store the executor in the database
-                MarketsRecorder.get_instance().store_or_update_executor(executor)
+                if executor.executor_info.is_done and executor.executor_info.close_type != CloseType.EARLY_STOP:
+                    MarketsRecorder.get_instance().store_or_update_executor(executor)
         # Remove the executors from the list
         self.active_executors = {}
 

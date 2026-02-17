@@ -57,10 +57,6 @@ class VikV2WithControllers(StrategyV2Base):
         self.kill_switch_counter: int = 0
         self._last_kill_switch_check_timestamp: float = 0.0
 
-
-    async def on_stop(self):
-        await super().on_stop()
-
     def on_tick(self):
         super().on_tick()
         if self.config.kill_switch_enabled:
@@ -141,6 +137,7 @@ class VikV2WithControllers(StrategyV2Base):
         df = pd.DataFrame(data=data, columns=columns)
         df.sort_values(by=["Market", "Pair"], inplace=True)
         return df
+    
     
     def check_balance_kill_switch(self) -> None:
         """
