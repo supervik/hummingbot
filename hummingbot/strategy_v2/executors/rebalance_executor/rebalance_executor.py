@@ -60,6 +60,7 @@ class RebalanceExecutor(ExecutorBase):
         for rebalance_item in self.assets_to_rebalance_info:
             side = TradeType.SELL if rebalance_item['diff'] > 0 else TradeType.BUY
             self.send_order_to_exchange(rebalance_item['pair'], side, abs(rebalance_item['diff']))
+            self._strategy.notify_hb_app(f"Rebalancing {side.name} {abs(rebalance_item['diff'])} {rebalance_item['pair']} ({round(abs(rebalance_item['diff_in_rebalance_asset']), 2)} {self.config.rebalance_asset})")
 
     def send_order_to_exchange(self, trading_pair: str, side: TradeType, amount: Decimal):
         """

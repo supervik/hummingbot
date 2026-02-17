@@ -17,6 +17,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
     connector_name: str = "binance"
 
     # Triangular configuration
+    # Format for triangles: "MAKER TAKER1 TAKER2 [buy_only|sell_only] [min_X] [max_X] [weight_X]
     triangles: List[str] = ["ATOM-BTC ATOM-USDT BTC-USDT", "XRP-BTC XRP-USDT BTC-USDT"]
     balances: Dict[str, Decimal] = {"ATOM": Decimal("5"), "BTC": Decimal("0.0002"), "XRP": Decimal("1000")}
     rebalance_asset: str = "USDT"
@@ -48,11 +49,12 @@ class TriangularMultipleConfig(ControllerConfigBase):
         """
         Parse a triangle string to extract pairs, flags, and parameter overrides.
         
-        Format: "MAKER TAKER1 TAKER2 [buy_only|sell_only] [min_X] [max_X]"
+        Format: "MAKER TAKER1 TAKER2 [buy_only|sell_only] [min_X] [max_X] [weight_X]"
         Examples:
           - "ATOM-BTC ATOM-USDT BTC-USDT"
           - "ATOM-BTC ATOM-USDT BTC-USDT buy_only min_0.25 max_0.6"
           - "LSK-USDC LSK-USDT USDC-USDT sell_only"
+          - "ATOM-BTC ATOM-USDT BTC-USDT weight_2.0 min_0.5 max_1"
         
         :param triangle_str: The triangle string to parse
         :return: Dict with parsed information
@@ -64,6 +66,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
         maker_pair, taker_1_pair, taker_2_pair = parts[:3]
         buy_only = sell_only = False
         min_profit = max_profit = None
+        weight = Decimal("1.0")  # Default weight is 1.0
         
         for token in parts[3:]:
             if token == "buy_only":
@@ -80,6 +83,15 @@ class TriangularMultipleConfig(ControllerConfigBase):
                     max_profit = Decimal(token[4:])
                 except (InvalidOperation, ValueError):
                     raise ValueError(f"Invalid max_profit value in '{triangle_str}': {token[4:]}")
+            elif token.startswith("weight_"):
+                try:
+                    weight = Decimal(token[7:])
+                    if weight <= Decimal("0"):
+                        raise ValueError(f"Weight must be positive in '{triangle_str}': {token[7:]}")
+                except (InvalidOperation, ValueError) as e:
+                    if isinstance(e, ValueError) and "must be positive" in str(e):
+                        raise
+                    raise ValueError(f"Invalid weight value in '{triangle_str}': {token[7:]}")
         
         if buy_only and sell_only:
             raise ValueError(f"Triangle '{triangle_str}' cannot have both buy_only and sell_only flags.")
@@ -92,6 +104,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
             "sell_only": sell_only,
             "min_profit": min_profit,
             "max_profit": max_profit,
+            "weight": weight,
         }
 
     def _parsed_triangles(self) -> List[Dict[str, Union[str, bool, Optional[Decimal]]]]:
@@ -100,26 +113,46 @@ class TriangularMultipleConfig(ControllerConfigBase):
             self._cached_parsed_triangles = [self._parse_triangle_string(t) for t in self.triangles]
         return self._cached_parsed_triangles
 
-    def _maker_asset_usage(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+    def _maker_asset_weights(self) -> Tuple[Dict[str, List[Tuple[str, Decimal]]], Dict[str, List[Tuple[str, Decimal]]]]:
         """
-        Counts how many triangles use each asset as maker base and maker quote.
-        Only counts assets that are actually needed based on buy_only/sell_only flags.
+        Returns weights for each asset used as maker base and maker quote.
+        Only includes assets that are actually needed based on buy_only/sell_only flags.
+        
+        Returns:
+            Tuple of (base_weights, quote_weights) where each dict maps asset -> list of (maker_pair, weight)
         """
-        base_usage: Dict[str, int] = {}
-        quote_usage: Dict[str, int] = {}
+        base_weights: Dict[str, List[Tuple[str, Decimal]]] = {}
+        quote_weights: Dict[str, List[Tuple[str, Decimal]]] = {}
 
         for parsed in self._parsed_triangles():
-            base, quote = parsed["maker_pair"].split("-")
+            maker_pair = parsed["maker_pair"]
+            base, quote = maker_pair.split("-")
+            weight = parsed.get("weight", Decimal("1.0"))
+            
             if not parsed["buy_only"]:
-                base_usage[base] = base_usage.get(base, 0) + 1
+                if base not in base_weights:
+                    base_weights[base] = []
+                base_weights[base].append((maker_pair, weight))
+            
             if not parsed["sell_only"]:
-                quote_usage[quote] = quote_usage.get(quote, 0) + 1
+                if quote not in quote_weights:
+                    quote_weights[quote] = []
+                quote_weights[quote].append((maker_pair, weight))
 
-        return base_usage, quote_usage
+        return base_weights, quote_weights
 
-    def _allocate_amount(self, balance: Decimal, count: int) -> Decimal:
-        """Allocate amount based on balance and usage count."""
-        return balance / Decimal(count) if count > 0 else Decimal("0")
+    def _allocate_amount_weighted(self, balance: Decimal, triangle_weight: Decimal, total_weight: Decimal) -> Decimal:
+        """
+        Allocate amount based on balance and weighted allocation.
+        
+        :param balance: Total balance to allocate
+        :param triangle_weight: Weight for this specific triangle
+        :param total_weight: Sum of all weights for triangles using this asset
+        :return: Allocated amount for this triangle
+        """
+        if total_weight == Decimal("0"):
+            return Decimal("0")
+        return balance * triangle_weight / total_weight
 
     @property
     def triangle_info(self) -> List[Dict[str, Union[str, Decimal, bool, Optional[Decimal]]]]:
@@ -128,19 +161,40 @@ class TriangularMultipleConfig(ControllerConfigBase):
         - base_amount: maker base units allocated (0 if buy_only)
         - quote_amount: maker quote units allocated (0 if sell_only)
         - min_profit, max_profit: per-triangle overrides or global defaults
-        Shared assets are split equally across triangles that use them.
+        - weight: allocation weight for this triangle (default 1.0)
+        Shared assets are split proportionally based on weights across triangles that use them.
         """
-        base_usage, quote_usage = self._maker_asset_usage()
+        base_weights, quote_weights = self._maker_asset_weights()
         triangle_dicts = []
 
         for parsed in self._parsed_triangles():
             maker_pair = parsed["maker_pair"]
             base, quote = maker_pair.split("-")
+            weight = parsed.get("weight", Decimal("1.0"))
 
-            base_amount = Decimal("0") if parsed["buy_only"] else \
-                self._allocate_amount(self.balances.get(base, Decimal("0")), base_usage.get(base, 0))
-            quote_amount = Decimal("0") if parsed["sell_only"] else \
-                self._allocate_amount(self.balances.get(quote, Decimal("0")), quote_usage.get(quote, 0))
+            # Calculate base amount allocation
+            if parsed["buy_only"]:
+                base_amount = Decimal("0")
+            else:
+                base_balance = self.balances.get(base, Decimal("0"))
+                if base in base_weights:
+                    # Calculate total weight for this asset
+                    total_base_weight = sum(w for _, w in base_weights[base])
+                    base_amount = self._allocate_amount_weighted(base_balance, weight, total_base_weight)
+                else:
+                    base_amount = Decimal("0")
+
+            # Calculate quote amount allocation
+            if parsed["sell_only"]:
+                quote_amount = Decimal("0")
+            else:
+                quote_balance = self.balances.get(quote, Decimal("0"))
+                if quote in quote_weights:
+                    # Calculate total weight for this asset
+                    total_quote_weight = sum(w for _, w in quote_weights[quote])
+                    quote_amount = self._allocate_amount_weighted(quote_balance, weight, total_quote_weight)
+                else:
+                    quote_amount = Decimal("0")
 
             triangle_dicts.append({
                 "maker": maker_pair,
@@ -154,6 +208,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
                 "sell_only": parsed["sell_only"],
                 "min_profit": parsed["min_profit"],
                 "max_profit": parsed["max_profit"],
+                "weight": weight,
             })
 
         return triangle_dicts
@@ -333,13 +388,19 @@ class TriangularMultiple(ControllerBase):
         status = []
         status.append(f"Triangular Multiple Controller: {self.config.id}")
         status.append(f"Controller status: {self._status}")
+        # Show configured target balances for quick inspection
+        try:
+            balances_str = ", ".join(f"{asset}: {amount}" for asset, amount in self.config.balances.items())
+        except Exception:
+            balances_str = str(self.config.balances)
+        status.append(f"Target balances: {balances_str}")
         # Add ready_for_new_triangle to triangle info for status display
-        triangle_info_with_state = []
-        for triangle in self.config.triangle_info:
-            triangle_copy = triangle.copy()
-            triangle_copy["ready_for_new_triangle"] = self.ready_for_new_triangle.get(triangle["maker"], True)
-            triangle_info_with_state.append(triangle_copy)
-        status.append(f"Triangle Info: {triangle_info_with_state}")
+        # triangle_info_with_state = []
+        # for triangle in self.config.triangle_info:
+        #     triangle_copy = triangle.copy()
+        #     triangle_copy["ready_for_new_triangle"] = self.ready_for_new_triangle.get(triangle["maker"], True)
+        #     triangle_info_with_state.append(triangle_copy)
+        # status.append(f"Triangle Info: {triangle_info_with_state}")
         # for executor in self.executors_info:
         #     status.append(f"\n{executor}")
         return status

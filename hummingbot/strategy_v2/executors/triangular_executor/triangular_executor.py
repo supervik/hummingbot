@@ -424,8 +424,10 @@ class TriangularExecutor(ExecutorBase):
             price=price)
 
         adjusted_candidate = self.connectors[self.config.connector_name].budget_checker.adjust_candidate(order_candidate, all_or_none=False)
-        if adjusted_candidate.amount == Decimal("0"):
-            self.notify("info", f"Not enough balance to place maker {side.name} order amount {amount} at price {price} on {self.config.maker_pair}")
+        quantized_amount = self.connectors[self.config.connector_name].quantize_order_amount(self.config.maker_pair, adjusted_candidate.amount)
+        
+        if quantized_amount < self.trading_rules_maker.min_order_size:
+            self.notify("warning", f"Not enough balance to place maker {side.name} order amount {amount} (adjusted: {quantized_amount}) at price {price} on {self.config.maker_pair}")
             return None
 
         order_id = self.place_order(
@@ -433,9 +435,9 @@ class TriangularExecutor(ExecutorBase):
             trading_pair=self.config.maker_pair,
             order_type=OrderType.LIMIT,
             side=side,
-            amount=adjusted_candidate.amount,
+            amount=quantized_amount,
             price=price)
-        self.notify("info", f"Sent maker {side.name} order amount {amount} at price {price} on {self.config.maker_pair}, id = {order_id}")
+        self.notify("info", f"Sent maker {side.name} order amount {amount} (adjusted: {quantized_amount}) at price {price} on {self.config.maker_pair}, id = {order_id}")
         return order_id
 
 
