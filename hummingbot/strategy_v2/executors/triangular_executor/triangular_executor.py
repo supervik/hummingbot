@@ -99,7 +99,6 @@ class TriangularExecutor(ExecutorBase):
         self.maker_ask_cancellation_in_progress = False
         # Track all active maker order IDs to handle race conditions (cancel + fill)
         self.current_maker_order_ids = set()
-        self.usdt_pair = config.taker_1_pair
         self.hedge_mode = False
         self.active_hedging_states: List[HedgingState] = []
         self.completion_timestamp: Optional[float] = None
@@ -121,7 +120,63 @@ class TriangularExecutor(ExecutorBase):
         self.taker_1_depth = TakerPairDepthTracker()
         self.taker_2_depth = TakerPairDepthTracker()
 
+        # Detect triangle type once at init (TYPE_A or TYPE_B)
+        self.triangle_type = self._detect_triangle_type()
+
+        # Find the pair that converts maker_base → usdt currency
+        self.usdt_pair = self._find_base_usd_pair()
+
         self._best_bidask_forwarder = SourceInfoEventForwarder(self.process_best_bidask_event)
+
+    def _detect_triangle_type(self) -> str:
+        """
+        Detect triangle type based on where the bridge asset sits in the taker pairs.
+
+        TYPE_A: bridge asset is quote of both taker pairs (taker_1_quote == taker_2_quote)
+                e.g. ATOM-BTC ATOM-USDT BTC-USDT  (bridge = USDT)
+        TYPE_B: bridge asset is quote of taker_1 and base of taker_2 (taker_1_quote == taker_2_base)
+                e.g. ATOM-USDT ATOM-BTC BTC-USDT  (bridge = BTC)
+        """
+        _, t1_quote = self.config.taker_1_pair.split("-")
+        t2_base, t2_quote = self.config.taker_2_pair.split("-")
+
+        if t1_quote == t2_quote:
+            self.notify("info", f"Triangle type: TYPE_A (bridge={t1_quote})")
+            return "TYPE_A"
+        elif t1_quote == t2_base:
+            self.notify("info", f"Triangle type: TYPE_B (bridge={t1_quote})")
+            return "TYPE_B"
+        else:
+            self.notify(
+                "error",
+                f"Unsupported triangle: taker_1={self.config.taker_1_pair}, "
+                f"taker_2={self.config.taker_2_pair}. "
+                f"taker_1 quote must match either taker_2 quote (TYPE_A) or taker_2 base (TYPE_B). "
+                f"Stopping executor.",
+                to_app=True,
+            )
+            self.close_type = CloseType.FAILED
+            self._status = RunnableStatus.SHUTTING_DOWN
+            return "TYPE_A"  # safe default to avoid further attribute errors before shutdown
+
+    def _find_base_usd_pair(self) -> str:
+        """
+        Find the pair that converts maker base asset → terminal currency (taker_2_quote).
+        The terminal currency is always taker_2_quote — the asset that closes the round trip.
+
+        e.g. ATOM-BTC ATOM-USDT BTC-USDT → terminal=USDT, returns ATOM-USDT (taker_1)
+             ATOM-USDT ATOM-BTC BTC-USDT → terminal=USDT, returns ATOM-USDT (maker)
+             BTC-EUR BTC-USDT USDT-EUR   → terminal=USDT,  returns BTC-USDT  (taker_1)
+        """
+        if 'USD' in self.config.taker_1_pair:
+            return self.config.taker_1_pair
+        elif 'USD' in self.config.maker_pair:
+            return self.config.maker_pair
+        else:
+            self.notify("error", f"Could not find USD pair for conversion, Stopping executor", to_app=True)
+            self.close_type = CloseType.FAILED
+            self._status = RunnableStatus.SHUTTING_DOWN
+        return None
 
     async def on_start(self):
         """
@@ -129,9 +184,9 @@ class TriangularExecutor(ExecutorBase):
         liquidates assets and stops. Otherwise proceeds with normal startup.
         """
         self.subscribe_to_events()
-        self.notify("info", f"Maker trading rules: {self.trading_rules_maker}")
-        self.notify("info", f"Taker 1 trading rules: {self.trading_rules_taker_1}")
-        self.notify("info", f"Taker 2 trading rules: {self.trading_rules_taker_2}")
+        # self.notify("info", f"Maker trading rules: {self.trading_rules_maker}")
+        # self.notify("info", f"Taker 1 trading rules: {self.trading_rules_taker_1}")
+        # self.notify("info", f"Taker 2 trading rules: {self.trading_rules_taker_2}")
         
         #2/4 CSV sync disabled for now (file creation and order-id logging)
         # csv_path = self.CSV_SYNC_PATH
@@ -233,6 +288,7 @@ class TriangularExecutor(ExecutorBase):
             elif current_time - self.completion_timestamp >= self.config.completion_wait_time:
                 # Wait time elapsed - check PnL and stop executor
                 pnl_pct = round(self.get_net_pnl_pct(),2)
+                pnl_quote = round(self.get_net_pnl_quote(),2)
                 self.notify("info", f"Completion wait time elapsed. Stopping executor. PNL: {pnl_pct}%")
                 
                 # Check if PnL is below kill switch threshold
@@ -246,7 +302,7 @@ class TriangularExecutor(ExecutorBase):
                     )
                 else:
                     self.close_type = CloseType.COMPLETED
-                    self.notify("info", f"------ Executor completed. Final PnL: {pnl_pct}%.", to_app=True)
+                    self.notify("info", f"------ Executor completed. Final PnL: {pnl_pct}% ({pnl_quote})", to_app=True)
                 
                 self._status = RunnableStatus.SHUTTING_DOWN
 
@@ -307,44 +363,66 @@ class TriangularExecutor(ExecutorBase):
         """
         Calculate order book depth for taker pairs based on order amounts.
         This runs continuously in the control loop to build depth history.
+
+        TYPE_A (e.g. ATOM-BTC ATOM-USDT BTC-USDT, bridge=USDT in quote of both takers):
+          Sell on maker → taker_1 BUY, taker_2 SELL
+          Buy on maker  → taker_1 SELL, taker_2 BUY
+
+        TYPE_B (e.g. ATOM-USDT ATOM-BTC BTC-USDT, bridge=BTC in quote of taker_1, base of taker_2):
+          Sell on maker → taker_1 BUY, taker_2 BUY
+          Buy on maker  → taker_1 SELL, taker_2 SELL
         """
         maker_bid_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestBid)
         maker_ask_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestAsk)
 
-        # Sell order on maker buy on taker
+        # Sell order on maker, buy on taker_1 (same base, opposite side)
         if self.place_sell_order:
             sell_amount_base = self.config.base_amount
             sell_amount_quote = sell_amount_base * maker_ask_price
 
-            # Calculate depth for taker_1 BUY (we buy on taker_1 when selling on maker)
+            # taker_1: always BUY when selling on maker (opposite side, same base amount)
             self._calculate_depth_for_side(
                 self.taker_1_depth, self.config.taker_1_pair, is_buy=True,
                 volume=sell_amount_base, use_quote_volume=False
             )
 
-            # Calculate depth for taker_2 SELL (we sell on taker_2 when selling on maker)
-            self._calculate_depth_for_side(
-                self.taker_2_depth, self.config.taker_2_pair, is_buy=False,
-                volume=sell_amount_quote, use_quote_volume=False
-            )
+            if self.triangle_type == "TYPE_A":
+                # taker_2 SELL: sell_amount_quote is the maker quote = taker_2 base (e.g. BTC)
+                self._calculate_depth_for_side(
+                    self.taker_2_depth, self.config.taker_2_pair, is_buy=False,
+                    volume=sell_amount_quote, use_quote_volume=False
+                )
+            else:  # TYPE_B
+                # taker_2 BUY: maker quote (e.g. USDT) is taker_2 quote → use quote volume directly
+                self._calculate_depth_for_side(
+                    self.taker_2_depth, self.config.taker_2_pair, is_buy=True,
+                    volume=sell_amount_quote, use_quote_volume=True
+                )
 
-        # Buy order on maker sell on taker
+        # Buy order on maker, sell on taker_1 (same base, opposite side)
         if self.place_buy_order:
             buy_amount_quote = self.config.quote_amount
             buy_amount_base = buy_amount_quote / maker_bid_price if maker_bid_price > Decimal("0") else Decimal("0")
 
-            # Calculate depth for taker_1 SELL (we sell on taker_1 when buying on maker)
+            # taker_1: always SELL when buying on maker (opposite side, same base amount)
             if buy_amount_base > Decimal("0"):
                 self._calculate_depth_for_side(
                     self.taker_1_depth, self.config.taker_1_pair, is_buy=False,
                     volume=buy_amount_base, use_quote_volume=False
                 )
 
-            # Calculate depth for taker_2 BUY (we buy on taker_2 when buying on maker)
-            self._calculate_depth_for_side(
-                self.taker_2_depth, self.config.taker_2_pair, is_buy=True,
-                volume=buy_amount_quote, use_quote_volume=False
-            )
+            if self.triangle_type == "TYPE_A":
+                # taker_2 BUY: buy_amount_quote is the maker quote = taker_2 base (e.g. BTC)
+                self._calculate_depth_for_side(
+                    self.taker_2_depth, self.config.taker_2_pair, is_buy=True,
+                    volume=buy_amount_quote, use_quote_volume=False
+                )
+            else:  # TYPE_B
+                # taker_2 SELL: maker quote (e.g. USDT) is taker_2 quote → use quote volume directly
+                self._calculate_depth_for_side(
+                    self.taker_2_depth, self.config.taker_2_pair, is_buy=False,
+                    volume=buy_amount_quote, use_quote_volume=True
+                )
 
     async def update_maker_target_prices(self):
         """
@@ -569,8 +647,20 @@ class TriangularExecutor(ExecutorBase):
 
                 # Create HedgingState
                 taker_1_side = TradeType.SELL if event.trade_type == TradeType.BUY else TradeType.BUY
-                taker_2_side = event.trade_type
-                taker_2_amount = event.amount * event.price
+                maker_quote_amount = event.amount * event.price
+
+                if self.triangle_type == "TYPE_A":
+                    taker_2_side = event.trade_type
+                    taker_2_amount = maker_quote_amount
+                else:  # TYPE_B
+                    taker_2_side = taker_1_side
+                    t2_depth_price = self.taker_2_depth.best_bid_price if taker_1_side == TradeType.SELL else self.taker_2_depth.best_ask_price
+                    t2_price_type = PriceType.BestBid if taker_1_side == TradeType.SELL else PriceType.BestAsk
+                    taker_2_price = t2_depth_price or self.get_price(self.config.connector_name, self.config.taker_2_pair, price_type=t2_price_type)
+                    if not taker_2_price:
+                        self.notify("error", "Taker 2 price unavailable, skipping hedge.")
+                        return
+                    taker_2_amount = maker_quote_amount / taker_2_price
 
                 # Compute exchange-side maker fill timestamp from in-flight order fills
                 maker_fill_exchange_ts: Optional[float] = self._get_last_fill_exchange_timestamp(event.order_id)
@@ -802,8 +892,13 @@ class TriangularExecutor(ExecutorBase):
         # Trade 2: Taker1 (always opposite of maker)
         amount = amount * taker1_vwap if is_buy else amount / taker1_vwap
 
-        # Trade 3: Taker2 (direction depends on whether taker quotes match)
-        amount = amount / taker2_vwap if is_buy else amount * taker2_vwap
+        # Trade 3: Taker2
+        # TYPE_A: taker2 price denominates the bridge (e.g. BTC-USDT bid when selling BTC) → divide
+        # TYPE_B: taker2 price converts bridge to terminal asset in same direction as taker1 → multiply
+        if self.triangle_type == "TYPE_A":
+            amount = amount / taker2_vwap if is_buy else amount * taker2_vwap
+        else:  # TYPE_B
+            amount = amount * taker2_vwap if is_buy else amount / taker2_vwap
 
         return Decimal("100") * (amount - Decimal("1")) - self.total_fee_pct
 
@@ -854,21 +949,34 @@ class TriangularExecutor(ExecutorBase):
     def _are_active_sides_ready(self) -> bool:
         """
         Check if depth is ready for the sides that are actually being used.
-        For sell side: taker_1 BUY, taker_2 SELL
-        For buy side: taker_1 SELL, taker_2 BUY
+
+        TYPE_A:
+          Sell side: taker_1 BUY, taker_2 SELL
+          Buy side:  taker_1 SELL, taker_2 BUY
+
+        TYPE_B:
+          Sell side: taker_1 BUY, taker_2 BUY
+          Buy side:  taker_1 SELL, taker_2 SELL
         """
-        # Check sell side requirements
-        if self.place_sell_order:
-            if not (self.taker_1_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES) and 
-                    self.taker_2_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES)):
-                return False
-        
-        # Check buy side requirements
-        if self.place_buy_order:
-            if not (self.taker_1_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES) and 
-                    self.taker_2_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES)):
-                return False
-        
+        if self.triangle_type == "TYPE_A":
+            if self.place_sell_order:
+                if not (self.taker_1_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES) and
+                        self.taker_2_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES)):
+                    return False
+            if self.place_buy_order:
+                if not (self.taker_1_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES) and
+                        self.taker_2_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES)):
+                    return False
+        else:  # TYPE_B
+            if self.place_sell_order:
+                if not (self.taker_1_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES) and
+                        self.taker_2_depth.is_buy_side_ready(self.MIN_DEPTH_SAMPLES)):
+                    return False
+            if self.place_buy_order:
+                if not (self.taker_1_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES) and
+                        self.taker_2_depth.is_sell_side_ready(self.MIN_DEPTH_SAMPLES)):
+                    return False
+
         return True
 
     def process_best_bidask_event(self, event_tag: int, market, event: OrderBookBestBidAskEvent):
@@ -914,22 +1022,44 @@ class TriangularExecutor(ExecutorBase):
         """
         Recalculate triangular taker result prices using event-based prices + depth.
         This is the single source of truth for taker result prices.
-        """
-        # Sell order on maker buy on taker
-        if self.place_sell_order:
-            taker_1_target_buy = self.taker_1_depth.get_target_price_buy()
-            taker_2_target_sell = self.taker_2_depth.get_target_price_sell()
-            
-            if taker_1_target_buy > Decimal("0") and taker_2_target_sell > Decimal("0"):
-                self.taker_result_buy_price = taker_1_target_buy / taker_2_target_sell
 
-        # Buy order on maker sell on taker
-        if self.place_buy_order:
-            taker_1_target_sell = self.taker_1_depth.get_target_price_sell()
-            taker_2_target_buy = self.taker_2_depth.get_target_price_buy()
-            if taker_1_target_sell > Decimal("0") and taker_2_target_buy > Decimal("0"):
-                self.taker_result_sell_price = taker_1_target_sell / taker_2_target_buy
-                # self.logger().info(f"Taker result sell price: {self.taker_result_sell_price}, Taker 1 target sell price: {taker_1_target_sell}, Taker 2 target buy price: {taker_2_target_buy}")
+        TYPE_A (e.g. ATOM-BTC ATOM-USDT BTC-USDT, bridge=USDT):
+          taker_result_buy_price  = taker_1_buy  / taker_2_sell  (ATOM-USDT ask / BTC-USDT bid)
+          taker_result_sell_price = taker_1_sell / taker_2_buy   (ATOM-USDT bid / BTC-USDT ask)
+
+        TYPE_B (e.g. ATOM-USDT ATOM-BTC BTC-USDT, bridge=BTC):
+          taker_result_buy_price  = taker_1_buy  * taker_2_buy   (ATOM-BTC ask * BTC-USDT ask)
+          taker_result_sell_price = taker_1_sell * taker_2_sell  (ATOM-BTC bid * BTC-USDT bid)
+        """
+        if self.triangle_type == "TYPE_A":
+            # Sell order on maker: buy on taker_1, sell on taker_2
+            if self.place_sell_order:
+                taker_1_target_buy = self.taker_1_depth.get_target_price_buy()
+                taker_2_target_sell = self.taker_2_depth.get_target_price_sell()
+                if taker_1_target_buy > Decimal("0") and taker_2_target_sell > Decimal("0"):
+                    self.taker_result_buy_price = taker_1_target_buy / taker_2_target_sell
+
+            # Buy order on maker: sell on taker_1, buy on taker_2
+            if self.place_buy_order:
+                taker_1_target_sell = self.taker_1_depth.get_target_price_sell()
+                taker_2_target_buy = self.taker_2_depth.get_target_price_buy()
+                if taker_1_target_sell > Decimal("0") and taker_2_target_buy > Decimal("0"):
+                    self.taker_result_sell_price = taker_1_target_sell / taker_2_target_buy
+
+        else:  # TYPE_B
+            # Sell order on maker: buy on taker_1, buy on taker_2
+            if self.place_sell_order:
+                taker_1_target_buy = self.taker_1_depth.get_target_price_buy()
+                taker_2_target_buy = self.taker_2_depth.get_target_price_buy()
+                if taker_1_target_buy > Decimal("0") and taker_2_target_buy > Decimal("0"):
+                    self.taker_result_buy_price = taker_1_target_buy * taker_2_target_buy
+
+            # Buy order on maker: sell on taker_1, sell on taker_2
+            if self.place_buy_order:
+                taker_1_target_sell = self.taker_1_depth.get_target_price_sell()
+                taker_2_target_sell = self.taker_2_depth.get_target_price_sell()
+                if taker_1_target_sell > Decimal("0") and taker_2_target_sell > Decimal("0"):
+                    self.taker_result_sell_price = taker_1_target_sell * taker_2_target_sell
 
     def _check_maker_orders_profitability(self):
         """

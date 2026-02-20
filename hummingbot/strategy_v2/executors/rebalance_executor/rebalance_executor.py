@@ -56,11 +56,14 @@ class RebalanceExecutor(ExecutorBase):
             self.stop()
 
     def rebalance(self):
-        self.logger().info(f"Start rebalancing assets")
-        for rebalance_item in self.assets_to_rebalance_info:
-            side = TradeType.SELL if rebalance_item['diff'] > 0 else TradeType.BUY
-            self.send_order_to_exchange(rebalance_item['pair'], side, abs(rebalance_item['diff']))
-            self._strategy.notify_hb_app(f"Rebalancing {side.name} {abs(rebalance_item['diff'])} {rebalance_item['pair']} ({round(abs(rebalance_item['diff_in_rebalance_asset']), 2)} {self.config.rebalance_asset})")
+        self.logger().info("Start rebalancing assets")
+        for item in self.assets_to_rebalance_info:
+            self.send_order_to_exchange(item['pair'], item['order_side'], item['order_amount'])
+            self._strategy.notify_hb_app(
+                f"Rebalancing {'buy' if item['is_buy'] else 'sell'} {abs(item['diff'])} {item['asset']} "
+                f"via {item['order_side'].name} {item['order_amount']} {item['pair']} "
+                f"({round(abs(item['diff_in_rebalance_asset']), 2)} {self.config.rebalance_asset})"
+            )
 
     def send_order_to_exchange(self, trading_pair: str, side: TradeType, amount: Decimal):
         """
@@ -89,37 +92,78 @@ class RebalanceExecutor(ExecutorBase):
             price=Decimal("0"))
         self.logger().info(f"Sent {side.name} order amount {amount} on {trading_pair}, id = {order_id} ")
         
+    def _resolve_pair(self, asset: str) -> Optional[tuple]:
+        """
+        Finds the trading pair for an asset against the rebalance asset.
+        Tries standard format first (e.g. EUR-USDT), then inverted (e.g. USDT-EUR).
+        Returns (pair, price, is_inverted) or None if unavailable.
+        """
+        available_pairs = self.connectors[self.config.connector_name].trading_pairs
+        candidates = [
+            (f"{asset}-{self.config.rebalance_asset}", False),
+            (f"{self.config.rebalance_asset}-{asset}", True),
+        ]
+        for pair, is_inverted in candidates:
+            if pair not in available_pairs:
+                continue
+            price = self.get_price(self.config.connector_name, pair, price_type=PriceType.MidPrice)
+            if not price or price == Decimal("0"):
+                self.logger().warning(f"Could not get price for {pair}, skipping {asset}")
+                return None
+            return pair, price, is_inverted
+        self.logger().warning(f"No trading pair found for {asset}/{self.config.rebalance_asset}, skipping")
+        return None
+
     async def validate_sufficient_balance(self):
         """
         Validates that the executor has sufficient balance to place orders.
         """
         for asset, target_balance in self.config.balances.items():
+            resolved = self._resolve_pair(asset)
+            if resolved is None:
+                continue
+            pair, pair_price, is_inverted = resolved
+
             real_balance = self.get_balance(self.config.connector_name, asset)
-            conersion_rate = self.get_price(self.config.connector_name, f"{asset}-{self.config.rebalance_asset}", price_type=PriceType.MidPrice)
             diff = real_balance - target_balance
-            diff_in_rebalance_asset = diff * conersion_rate
+            conversion_rate = Decimal("1") / pair_price if is_inverted else pair_price
+            diff_in_rebalance_asset = diff * conversion_rate
 
             if abs(diff_in_rebalance_asset) > self.config.min_usdt:
+                is_buy = diff < 0
+                if is_inverted:
+                    # Inverted pair (e.g. USDT-EUR): asset is the quote, so buying EUR = selling USDT-EUR
+                    order_side = TradeType.SELL if is_buy else TradeType.BUY
+                    order_amount = abs(diff) / pair_price
+                else:
+                    # Standard pair (e.g. EUR-USDT): asset is the base, order side matches the asset action
+                    order_side = TradeType.BUY if is_buy else TradeType.SELL
+                    order_amount = abs(diff)
                 self.assets_to_rebalance_info.append({
                     "asset": asset,
-                    "pair": f"{asset}-{self.config.rebalance_asset}",
+                    "pair": pair,
+                    "is_buy": is_buy,
+                    "order_side": order_side,
+                    "order_amount": order_amount,
                     "target_balance": target_balance,
                     "real_balance": real_balance,
                     "diff": diff,
                     "diff_in_rebalance_asset": diff_in_rebalance_asset,
-                    "is_buy": diff_in_rebalance_asset > 0
                 })
 
-        if len(self.assets_to_rebalance_info) > 0:
+        if self.assets_to_rebalance_info:
             self.assets_to_rebalance_info.sort(key=lambda x: x['diff_in_rebalance_asset'], reverse=True)
-            self.logger().info(f"!!! ATTENTION !!! Assets needed to be rebalanced:")
-            for asset_info in self.assets_to_rebalance_info:
-                side = 'sell' if asset_info['diff'] > 0 else 'buy'
-                self.logger().info(f" {asset_info['asset']}: {side} {abs(asset_info['diff'])} {asset_info['pair']} ({round(asset_info['diff_in_rebalance_asset'], 2)} {self.config.rebalance_asset})")
-            self.logger().info(f"Sleeping for 30 seconds before rebalance.")
+            self.logger().info("!!! ATTENTION !!! Assets needed to be rebalanced:")
+            for info in self.assets_to_rebalance_info:
+                self.logger().info(
+                    f" {info['asset']}: {'buy' if info['is_buy'] else 'sell'} {abs(info['diff'])} {info['asset']} "
+                    f"via {info['order_side'].name} {info['order_amount']} {info['pair']} "
+                    f"({round(info['diff_in_rebalance_asset'], 2)} {self.config.rebalance_asset})"
+                )
+            self.logger().info("Sleeping for 30 seconds before rebalance.")
             self.timestamp_to_rebalance = self._strategy.current_timestamp + 30
         else:
-            self.logger().info(f"No assets needed to be rebalanced")
+            self.logger().info("No assets needed to be rebalanced")
             self.close_type = CloseType.COMPLETED
             self.stop()
 
