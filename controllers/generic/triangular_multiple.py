@@ -113,33 +113,32 @@ class TriangularMultipleConfig(ControllerConfigBase):
             self._cached_parsed_triangles = [self._parse_triangle_string(t) for t in self.triangles]
         return self._cached_parsed_triangles
 
-    def _maker_asset_weights(self) -> Tuple[Dict[str, List[Tuple[str, Decimal]]], Dict[str, List[Tuple[str, Decimal]]]]:
+    def _maker_asset_usages(self) -> Dict[str, List[Tuple[str, Decimal]]]:
         """
-        Returns weights for each asset used as maker base and maker quote.
-        Only includes assets that are actually needed based on buy_only/sell_only flags.
-        
+        Returns all usages of each asset across maker pairs, combining base and quote roles
+        into a single pool per asset.
+
+        This ensures that an asset appearing as base in some triangles and quote in others
+        is allocated from the same shared balance rather than two independent pools.
+
         Returns:
-            Tuple of (base_weights, quote_weights) where each dict maps asset -> list of (maker_pair, weight)
+            Dict mapping asset -> list of (maker_pair, weight) for every triangle that
+            consumes that asset (whether as base or as quote).
         """
-        base_weights: Dict[str, List[Tuple[str, Decimal]]] = {}
-        quote_weights: Dict[str, List[Tuple[str, Decimal]]] = {}
+        usages: Dict[str, List[Tuple[str, Decimal]]] = {}
 
         for parsed in self._parsed_triangles():
             maker_pair = parsed["maker_pair"]
             base, quote = maker_pair.split("-")
             weight = parsed.get("weight", Decimal("1.0"))
-            
-            if not parsed["buy_only"]:
-                if base not in base_weights:
-                    base_weights[base] = []
-                base_weights[base].append((maker_pair, weight))
-            
-            if not parsed["sell_only"]:
-                if quote not in quote_weights:
-                    quote_weights[quote] = []
-                quote_weights[quote].append((maker_pair, weight))
 
-        return base_weights, quote_weights
+            if not parsed["buy_only"]:   # triangle consumes base asset
+                usages.setdefault(base, []).append((maker_pair, weight))
+
+            if not parsed["sell_only"]:  # triangle consumes quote asset
+                usages.setdefault(quote, []).append((maker_pair, weight))
+
+        return usages
 
     def _allocate_amount_weighted(self, balance: Decimal, triangle_weight: Decimal, total_weight: Decimal) -> Decimal:
         """
@@ -164,7 +163,7 @@ class TriangularMultipleConfig(ControllerConfigBase):
         - weight: allocation weight for this triangle (default 1.0)
         Shared assets are split proportionally based on weights across triangles that use them.
         """
-        base_weights, quote_weights = self._maker_asset_weights()
+        usages = self._maker_asset_usages()
         triangle_dicts = []
 
         for parsed in self._parsed_triangles():
@@ -172,29 +171,21 @@ class TriangularMultipleConfig(ControllerConfigBase):
             base, quote = maker_pair.split("-")
             weight = parsed.get("weight", Decimal("1.0"))
 
-            # Calculate base amount allocation
+            # Allocate base: shared across all triangles that consume this asset (as base or quote)
             if parsed["buy_only"]:
                 base_amount = Decimal("0")
             else:
                 base_balance = self.balances.get(base, Decimal("0"))
-                if base in base_weights:
-                    # Calculate total weight for this asset
-                    total_base_weight = sum(w for _, w in base_weights[base])
-                    base_amount = self._allocate_amount_weighted(base_balance, weight, total_base_weight)
-                else:
-                    base_amount = Decimal("0")
+                total_weight = sum(w for _, w in usages.get(base, []))
+                base_amount = self._allocate_amount_weighted(base_balance, weight, total_weight)
 
-            # Calculate quote amount allocation
+            # Allocate quote: shared across all triangles that consume this asset (as base or quote)
             if parsed["sell_only"]:
                 quote_amount = Decimal("0")
             else:
                 quote_balance = self.balances.get(quote, Decimal("0"))
-                if quote in quote_weights:
-                    # Calculate total weight for this asset
-                    total_quote_weight = sum(w for _, w in quote_weights[quote])
-                    quote_amount = self._allocate_amount_weighted(quote_balance, weight, total_quote_weight)
-                else:
-                    quote_amount = Decimal("0")
+                total_weight = sum(w for _, w in usages.get(quote, []))
+                quote_amount = self._allocate_amount_weighted(quote_balance, weight, total_weight)
 
             triangle_dicts.append({
                 "maker": maker_pair,
