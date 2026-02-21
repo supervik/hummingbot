@@ -325,7 +325,7 @@ class TriangularMultiple(ControllerBase):
                     fee_taker=self.config.taker_fee,
                     min_usdt=self.config.min_usdt,
                     taker_fill_completion_ratio=self.config.taker_fill_completion_ratio,
-                    maker_quote_buffer_inverse_pct=self.config.maker_quote_buffer_inverse_pct,
+                    maker_quote_buffer_inverse=self.config.maker_quote_buffer_inverse,
                     kill_switch_pnl_threshold=self.config.kill_switch_pnl_threshold,
                 )
                 executor_actions.append(CreateExecutorAction(
