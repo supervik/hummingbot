@@ -123,6 +123,9 @@ class TriangularExecutor(ExecutorBase):
         # Detect triangle type once at init (TYPE_A or TYPE_B)
         self.triangle_type = self._detect_triangle_type()
 
+        # Inverse (Type B): apply quote buffer and set effective amounts (used for order sizing)
+        self._apply_inverse_quote_settings()
+
         # Find the pair that converts maker_base → usdt currency
         self.usdt_pair = self._find_base_usd_pair()
 
@@ -159,6 +162,37 @@ class TriangularExecutor(ExecutorBase):
             self._status = RunnableStatus.SHUTTING_DOWN
             return "TYPE_A"  # safe default to avoid further attribute errors before shutdown
 
+    def _apply_inverse_quote_settings(self, check_balance: bool = False) -> bool:
+        """
+        Inverse (Type B) triangles: reserve a % of quote for taker_2 when maker sell fills,
+        and optionally check that sell-only has non-zero maker-quote balance.
+        Sets self.effective_base_amount and self.effective_quote_amount (used for order sizing).
+        :param check_balance: If True, for sell_only Type B check maker-quote balance > 0.
+        :return: False if check_balance and sell_only Type B and balance <= 0 (caller should stop).
+        """
+        self.effective_base_amount = self.config.base_amount
+        self.effective_quote_amount = self.config.quote_amount
+        if self.triangle_type == "TYPE_B" :
+            if self.place_buy_order and self.place_sell_order and self.config.maker_quote_buffer_inverse > Decimal("0"):
+                self.effective_quote_amount = self.config.quote_amount * (Decimal("1") - self.config.maker_quote_buffer_inverse)
+                self.notify("info", f"Inverse quote buffer applied: quote_amount {self.config.quote_amount} -> {self.effective_quote_amount}")
+                return True
+
+            if not self.place_buy_order:
+                maker_quote = self.config.maker_pair.split("-")[1]
+                balance = self.get_balance(self.config.connector_name, maker_quote)
+                if balance is None or balance <= Decimal("0"):
+                    self.notify(
+                        "error",
+                        f"Sell-only Type B requires non-zero {maker_quote} balance for taker_2. "
+                        f"Current balance: {balance}. Stopping executor.",
+                        to_app=True,
+                    )
+                    self.close_type = CloseType.FAILED
+                    self._status = RunnableStatus.SHUTTING_DOWN
+                    return False
+        return True
+
     def _find_base_usd_pair(self) -> str:
         """
         Find the pair that converts maker base asset → terminal currency (taker_2_quote).
@@ -184,6 +218,7 @@ class TriangularExecutor(ExecutorBase):
         liquidates assets and stops. Otherwise proceeds with normal startup.
         """
         self.subscribe_to_events()
+
         # self.notify("info", f"Maker trading rules: {self.trading_rules_maker}")
         # self.notify("info", f"Taker 1 trading rules: {self.trading_rules_taker_1}")
         # self.notify("info", f"Taker 2 trading rules: {self.trading_rules_taker_2}")
@@ -377,7 +412,7 @@ class TriangularExecutor(ExecutorBase):
 
         # Sell order on maker, buy on taker_1 (same base, opposite side)
         if self.place_sell_order:
-            sell_amount_base = self.config.base_amount
+            sell_amount_base = self.effective_base_amount
             sell_amount_quote = sell_amount_base * maker_ask_price
 
             # taker_1: always BUY when selling on maker (opposite side, same base amount)
@@ -401,7 +436,7 @@ class TriangularExecutor(ExecutorBase):
 
         # Buy order on maker, sell on taker_1 (same base, opposite side)
         if self.place_buy_order:
-            buy_amount_quote = self.config.quote_amount
+            buy_amount_quote = self.effective_quote_amount
             buy_amount_base = buy_amount_quote / maker_bid_price if maker_bid_price > Decimal("0") else Decimal("0")
 
             # taker_1: always SELL when buying on maker (opposite side, same base amount)
@@ -469,7 +504,7 @@ class TriangularExecutor(ExecutorBase):
                 self.notify("info", "Waiting for taker result price (buy side)")
                 return
             current_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestAsk)
-            amount_to_buy = self.config.quote_amount / current_price
+            amount_to_buy = self.effective_quote_amount / current_price
             bid_order_id = await self.send_maker_order_to_exchange(side=TradeType.BUY, amount=amount_to_buy, price=self.maker_target_buy_price)
             if bid_order_id:
                 self.maker_bid_order = TrackedOrder(order_id=bid_order_id)
@@ -482,7 +517,8 @@ class TriangularExecutor(ExecutorBase):
             if self.taker_result_buy_price == Decimal("0"):
                 self.notify("info", "Waiting for taker result price (sell side)")
                 return
-            ask_order_id = await self.send_maker_order_to_exchange(side=TradeType.SELL, amount=self.config.base_amount, price=self.maker_target_sell_price)
+            amount_to_sell = self.effective_base_amount
+            ask_order_id = await self.send_maker_order_to_exchange(side=TradeType.SELL, amount=amount_to_sell, price=self.maker_target_sell_price)
             if ask_order_id:
                 self.maker_ask_order = TrackedOrder(order_id=ask_order_id)
                 self.current_maker_order_ids.add(ask_order_id)
@@ -671,11 +707,13 @@ class TriangularExecutor(ExecutorBase):
                         trading_pair=self.config.taker_1_pair,
                         side=taker_1_side,
                         amount=event.amount,
+                        fill_ratio_threshold=self.config.taker_fill_completion_ratio,
                     ),
                     taker_2=TakerOrderInfo(
                         trading_pair=self.config.taker_2_pair,
                         side=taker_2_side,
                         amount=taker_2_amount,
+                        fill_ratio_threshold=self.config.taker_fill_completion_ratio,
                     ),
                     created_timestamp=time.time(),
                     maker_fill_server_ts=time.time(),
@@ -755,15 +793,17 @@ class TriangularExecutor(ExecutorBase):
     def place_taker_order(self, taker_info: TakerOrderInfo, log_retry: bool = False) -> Optional[str]:
         """
         Place a taker order and update tracking.
-
-        :param taker_info: The TakerOrderInfo to place order for
-        :param log_retry: Whether to log retry messages
-        :return: The order_id if successful, None otherwise
+        On retry, places only the remaining amount (amount - filled_amount).
         """
+        order_amount = taker_info.amount - taker_info.filled_amount if taker_info.filled_events else taker_info.amount
+        if order_amount <= Decimal("0"):
+            self.notify("info", f"Order amount on {taker_info.trading_pair} less than 0. Don't place order")
+            return None
+
         order_id = self.send_taker_order_to_exchange(
             taker_info.trading_pair,
             taker_info.side,
-            taker_info.amount
+            order_amount,
         )
         if order_id:
             taker_info.order_id = order_id

@@ -30,6 +30,8 @@ class TriangularMultipleConfig(ControllerConfigBase):
     maker_fee: Decimal = Decimal("0.1")
     taker_fee: Decimal = Decimal("0.1")
     kill_switch_pnl_threshold: Decimal = Decimal("-0.2")
+    taker_fill_completion_ratio: Decimal = Decimal("0.99")
+    maker_quote_buffer_inverse: Decimal = Decimal("0.005")  # For inverse triangles, need some quote asset for taker_2 orders 
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
         for triangle in self.triangles:
@@ -322,6 +324,8 @@ class TriangularMultiple(ControllerBase):
                     fee_maker=self.config.maker_fee,
                     fee_taker=self.config.taker_fee,
                     min_usdt=self.config.min_usdt,
+                    taker_fill_completion_ratio=self.config.taker_fill_completion_ratio,
+                    maker_quote_buffer_inverse_pct=self.config.maker_quote_buffer_inverse_pct,
                     kill_switch_pnl_threshold=self.config.kill_switch_pnl_threshold,
                 )
                 executor_actions.append(CreateExecutorAction(

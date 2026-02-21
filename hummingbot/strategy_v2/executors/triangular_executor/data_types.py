@@ -91,15 +91,24 @@ class TakerOrderInfo(BaseModel):
     trading_pair: str
     side: TradeType
     amount: Decimal
+    fill_ratio_threshold: Decimal = Decimal("1")
     completed: Optional[Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]] = None
     filled_events: List[OrderFilledEvent] = []
     trials: int = 0
     sent_timestamp: Optional[float] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    @property
+    def filled_amount(self) -> Decimal:
+        return sum((e.amount for e in self.filled_events), Decimal("0"))
+
     def is_complete(self) -> bool:
-        """Check if the taker order is completed."""
-        return self.completed is not None
+        """Complete if exchange confirmed full fill, or filled ratio >= threshold."""
+        if self.completed is not None:
+            return True
+        if self.filled_events and self.amount > Decimal("0") and self.fill_ratio_threshold < Decimal("1"):
+            return self.filled_amount / self.amount >= self.fill_ratio_threshold
+        return False
 
 
 class HedgingState(BaseModel):
@@ -120,7 +129,7 @@ class HedgingState(BaseModel):
 
     def is_failed(self, max_retries: int) -> bool:
         """Check if any taker order exceeded max retries."""
-        return (self.taker_1.trials > max_retries) or (self.taker_2.trials > max_retries)
+        return (self.taker_1.trials >= max_retries) or (self.taker_2.trials >= max_retries)
 
 
 class TriangularExecutorConfig(ExecutorConfigBase):
@@ -136,6 +145,8 @@ class TriangularExecutorConfig(ExecutorConfigBase):
     fee_maker: Decimal
     fee_taker: Decimal
     min_usdt: Decimal
+    taker_fill_completion_ratio: Decimal = Decimal("1")
+    maker_quote_buffer_inverse: Decimal = Decimal("0")
     max_taker_retries: int = 10
     taker_retry_delay: float = 10.0
     completion_wait_time: float = 5.0
