@@ -8,6 +8,7 @@ from pydantic import Field
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.clock import Clock
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -204,6 +205,180 @@ class VikV2WithControllers(StrategyV2Base):
         else:
             # Drawdown is within acceptable range, reset counter
             self.kill_switch_counter = 0
+
+    def _get_all_executors_including_history(self) -> List[ExecutorInfo]:
+        """
+        Return all executors for current controllers, including stored (historical) executors
+        from the DB and in-memory executors not yet stored. Deduplicated by executor id.
+        """
+        seen_ids: Set[str] = set()
+        result: List[ExecutorInfo] = []
+
+        # 1) Load from DB (full history for our controllers)
+        try:
+            recorder = MarketsRecorder.get_instance()
+            if recorder is not None:
+                for controller_id in self.controllers.keys():
+                    for ei in recorder.get_executors_by_controller(controller_id):
+                        if ei.id not in seen_ids:
+                            seen_ids.add(ei.id)
+                            result.append(ei)
+        except Exception:
+            pass
+
+        # 2) Add in-memory executors not yet in DB (recent closed + active)
+        for controller_id in self.controllers.keys():
+            for ei in self.get_executors_by_controller(controller_id):
+                if ei.id not in seen_ids:
+                    seen_ids.add(ei.id)
+                    result.append(ei)
+
+        return result
+    
+    def _format_global_breakdowns(self, executors_info: List[ExecutorInfo]) -> List[str]:
+        """
+        Build additional global performance breakdown tables:
+        - by maker_pair
+        - by day (last 7 days)
+        - by week (last 4 weeks)
+        """
+        lines: List[str] = []
+        if not executors_info:
+            return lines
+
+        df = pd.DataFrame([ei.to_dict() for ei in executors_info])
+        if df.empty:
+            return lines
+
+        # Ensure numeric columns are available
+        for col in ["net_pnl_quote", "filled_amount_quote"]:
+            if col not in df.columns:
+                return lines
+
+        df["net_pnl_quote"] = pd.to_numeric(df["net_pnl_quote"], errors="coerce").fillna(0)
+        df["filled_amount_quote"] = pd.to_numeric(df["filled_amount_quote"], errors="coerce").fillna(0)
+
+        # maker_pair from custom_info (if present)
+        if "custom_info" in df.columns:
+            df["maker_pair"] = df["custom_info"].apply(
+                lambda x: x.get("maker_pair") if isinstance(x, dict) else None
+            )
+        else:
+            df["maker_pair"] = None
+
+        # Timestamps for day/week aggregations
+        if "timestamp" in df.columns:
+            df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+        else:
+            df["timestamp_dt"] = pd.NaT
+
+        now = pd.to_datetime(self.current_timestamp, unit="s")
+
+        # ---- Global by maker_pair ----
+        grouped_mp = (
+            df.groupby(df["maker_pair"].fillna("UNKNOWN"))[["net_pnl_quote", "filled_amount_quote"]]
+            .sum()
+            .reset_index()
+        )
+        if not grouped_mp.empty:
+            grouped_mp.rename(columns={"maker_pair": "Maker Pair"}, inplace=True)
+            grouped_mp["Global PnL"] = grouped_mp["net_pnl_quote"]
+            grouped_mp["Volume Traded"] = grouped_mp["filled_amount_quote"]
+            grouped_mp["Global PnL %"] = grouped_mp.apply(
+                lambda r: (r["Global PnL"] / r["Volume Traded"] * 100) if r["Volume Traded"] > 0 else 0,
+                axis=1,
+            )
+            by_mp_df = grouped_mp[["Maker Pair", "Global PnL", "Global PnL %", "Volume Traded"]].copy()
+            by_mp_df["Global PnL"] = by_mp_df["Global PnL"].map(lambda x: f"${x:.2f}")
+            by_mp_df["Global PnL %"] = by_mp_df["Global PnL %"].map(lambda x: f"{x:.2f}%")
+            by_mp_df["Volume Traded"] = by_mp_df["Volume Traded"].map(lambda x: f"${x:.2f}")
+
+            lines.append("")
+            lines.append(f"{'-' * 80}")
+            lines.append("GLOBAL PERFORMANCE BY MAKER PAIR")
+            lines.append(f"{'-' * 80}")
+            lines.append(
+                format_df_for_printout(
+                    by_mp_df.sort_values("Global PnL", ascending=False),
+                    table_format="psql",
+                    index=False,
+                )
+            )
+
+        # ---- Global by day (last 7 days) ----
+        recent_days_mask = df["timestamp_dt"].notna() & (
+            df["timestamp_dt"] >= now - pd.Timedelta(days=7)
+        )
+        df_recent_days = df[recent_days_mask].copy()
+        if not df_recent_days.empty:
+            df_recent_days["date"] = df_recent_days["timestamp_dt"].dt.date
+            grouped_day = (
+                df_recent_days.groupby("date")[["net_pnl_quote", "filled_amount_quote"]]
+                .sum()
+                .reset_index()
+            )
+            grouped_day.rename(columns={"date": "Day"}, inplace=True)
+            grouped_day["Global PnL"] = grouped_day["net_pnl_quote"]
+            grouped_day["Volume Traded"] = grouped_day["filled_amount_quote"]
+            grouped_day["Global PnL %"] = grouped_day.apply(
+                lambda r: (r["Global PnL"] / r["Volume Traded"] * 100) if r["Volume Traded"] > 0 else 0,
+                axis=1,
+            )
+            by_day_df = grouped_day[["Day", "Global PnL", "Global PnL %", "Volume Traded"]].copy()
+            by_day_df["Global PnL"] = by_day_df["Global PnL"].map(lambda x: f"${x:.2f}")
+            by_day_df["Global PnL %"] = by_day_df["Global PnL %"].map(lambda x: f"{x:.2f}%")
+            by_day_df["Volume Traded"] = by_day_df["Volume Traded"].map(lambda x: f"${x:.2f}")
+
+            lines.append("")
+            lines.append(f"{'-' * 80}")
+            lines.append("GLOBAL PERFORMANCE BY DAY (Last 7 days)")
+            lines.append(f"{'-' * 80}")
+            lines.append(
+                format_df_for_printout(
+                    by_day_df.sort_values("Day", ascending=False),
+                    table_format="psql",
+                    index=False,
+                )
+            )
+
+        # ---- Global by week (last 4 weeks) ----
+        recent_weeks_mask = df["timestamp_dt"].notna() & (
+            df["timestamp_dt"] >= now - pd.Timedelta(weeks=4)
+        )
+        df_recent_weeks = df[recent_weeks_mask].copy()
+        if not df_recent_weeks.empty:
+            week_period = df_recent_weeks["timestamp_dt"].dt.to_period("W")
+            df_recent_weeks["week"] = week_period.astype(str)
+            grouped_week = (
+                df_recent_weeks.groupby("week")[["net_pnl_quote", "filled_amount_quote"]]
+                .sum()
+                .reset_index()
+            )
+            grouped_week.rename(columns={"week": "Week"}, inplace=True)
+            grouped_week["Global PnL"] = grouped_week["net_pnl_quote"]
+            grouped_week["Volume Traded"] = grouped_week["filled_amount_quote"]
+            grouped_week["Global PnL %"] = grouped_week.apply(
+                lambda r: (r["Global PnL"] / r["Volume Traded"] * 100) if r["Volume Traded"] > 0 else 0,
+                axis=1,
+            )
+            by_week_df = grouped_week[["Week", "Global PnL", "Global PnL %", "Volume Traded"]].copy()
+            by_week_df["Global PnL"] = by_week_df["Global PnL"].map(lambda x: f"${x:.2f}")
+            by_week_df["Global PnL %"] = by_week_df["Global PnL %"].map(lambda x: f"{x:.2f}%")
+            by_week_df["Volume Traded"] = by_week_df["Volume Traded"].map(lambda x: f"${x:.2f}")
+
+            lines.append("")
+            lines.append(f"{'-' * 80}")
+            lines.append("GLOBAL PERFORMANCE BY WEEK (Last 4 weeks)")
+            lines.append(f"{'-' * 80}")
+            lines.append(
+                format_df_for_printout(
+                    by_week_df.sort_values("Week", ascending=False),
+                    table_format="psql",
+                    index=False,
+                )
+            )
+
+        return lines
     
     def format_status(self) -> str:
         """
@@ -326,5 +501,12 @@ class VikV2WithControllers(StrategyV2Base):
 
             performance_df = pd.DataFrame(performance_data)
             lines.append(format_df_for_printout(performance_df, table_format="psql", index=False))
+
+            # Additional global breakdowns (use all executors including history from DB)
+            try:
+                lines.extend(self._format_global_breakdowns(self._get_all_executors_including_history()))
+            except Exception as e:
+                # Avoid breaking format_status if something goes wrong in the breakdowns
+                self.logger().debug(f"Error while generating global breakdowns: {e}")
 
         return "\n".join(lines)
