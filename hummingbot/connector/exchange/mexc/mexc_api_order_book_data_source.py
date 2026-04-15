@@ -161,7 +161,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return channel
 
     async def _trigger_best_bidask_event(self, event_message: Dict[str, Any]) -> None:
-        ticker = event_message.get("publicbookticker")
+        ticker = event_message.get("publicAggreBookTicker")
         if not ticker:
             return
         exchange_symbol = event_message.get("symbol", "")
@@ -169,11 +169,11 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return
 
         trading_pair = self._get_trading_pair_from_cache(exchange_symbol)
-        best_bid_price = Decimal(str(ticker["bidprice"]))
-        best_bid_size = Decimal(str(ticker["bidquantity"]))
-        best_ask_price = Decimal(str(ticker["askprice"]))
-        best_ask_size = Decimal(str(ticker["askquantity"]))
-        ticker_id = event_message.get("sendtime", "")
+        best_bid_price = Decimal(str(ticker["bidPrice"]))
+        best_bid_size = Decimal(str(ticker["bidQuantity"]))
+        best_ask_price = Decimal(str(ticker["askPrice"]))
+        best_ask_size = Decimal(str(ticker["askQuantity"]))
+        ticker_id = event_message.get("sendTime", "")
         self._connector.trigger_event(
             OrderBookDataSourceEvent.BEST_BID_ASK_EVENT,
             OrderBookBestBidAskEvent(trading_pair, ticker_id, best_bid_price, best_ask_price, best_bid_size, best_ask_size)
