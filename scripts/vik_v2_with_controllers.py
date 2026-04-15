@@ -266,11 +266,11 @@ class VikV2WithControllers(StrategyV2Base):
         else:
             df["maker_pair"] = None
 
-        # Timestamps for day/week aggregations
-        if "timestamp" in df.columns:
-            df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+        # Timestamps for day/week aggregations (use executor close time, not open time)
+        if "close_timestamp" in df.columns:
+            df["close_timestamp_dt"] = pd.to_datetime(df["close_timestamp"], unit="s", errors="coerce")
         else:
-            df["timestamp_dt"] = pd.NaT
+            df["close_timestamp_dt"] = pd.NaT
 
         now = pd.to_datetime(self.current_timestamp, unit="s")
 
@@ -305,13 +305,13 @@ class VikV2WithControllers(StrategyV2Base):
                 )
             )
 
-        # ---- Global by day (last 7 days) ----
-        recent_days_mask = df["timestamp_dt"].notna() & (
-            df["timestamp_dt"] >= now - pd.Timedelta(days=7)
+        # ---- Global by day (last 7 days, based on close time) ----
+        recent_days_mask = df["close_timestamp_dt"].notna() & (
+            df["close_timestamp_dt"] >= now - pd.Timedelta(days=7)
         )
         df_recent_days = df[recent_days_mask].copy()
         if not df_recent_days.empty:
-            df_recent_days["date"] = df_recent_days["timestamp_dt"].dt.date
+            df_recent_days["date"] = df_recent_days["close_timestamp_dt"].dt.date
             grouped_day = (
                 df_recent_days.groupby("date")[["net_pnl_quote", "filled_amount_quote"]]
                 .sum()
@@ -341,13 +341,13 @@ class VikV2WithControllers(StrategyV2Base):
                 )
             )
 
-        # ---- Global by week (last 4 weeks) ----
-        recent_weeks_mask = df["timestamp_dt"].notna() & (
-            df["timestamp_dt"] >= now - pd.Timedelta(weeks=4)
+        # ---- Global by week (last 4 weeks, based on close time) ----
+        recent_weeks_mask = df["close_timestamp_dt"].notna() & (
+            df["close_timestamp_dt"] >= now - pd.Timedelta(weeks=4)
         )
         df_recent_weeks = df[recent_weeks_mask].copy()
         if not df_recent_weeks.empty:
-            week_period = df_recent_weeks["timestamp_dt"].dt.to_period("W")
+            week_period = df_recent_weeks["close_timestamp_dt"].dt.to_period("W")
             df_recent_weeks["week"] = week_period.astype(str)
             grouped_week = (
                 df_recent_weeks.groupby("week")[["net_pnl_quote", "filled_amount_quote"]]
@@ -391,18 +391,16 @@ class VikV2WithControllers(StrategyV2Base):
         warning_lines = []
         warning_lines.extend(self.network_warning(self.get_market_trading_pair_tuples()))
 
-        # Basic account info
-        balance_df = self.get_balance_df()
-        lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
-
-        try:
-            df = self.active_orders_df()
-            lines.extend(["", "  Orders:"] + ["    " + line for line in df.to_string(index=False).split("\n")])
-        except ValueError:
-            lines.extend(["", "  No active maker orders."])
-
         # Controller sections
         performance_data = []
+
+        # Additional global breakdowns (use all executors including history from DB)
+        try:
+            lines.extend(self._format_global_breakdowns(self._get_all_executors_including_history()))
+        except Exception as e:
+            # Avoid breaking format_status if something goes wrong in the breakdowns
+            self.logger().debug(f"Error while generating global breakdowns: {e}")
+        
 
         for controller_id, controller in self.controllers.items():
             lines.append(f"\n{'=' * 60}")
@@ -475,7 +473,7 @@ class VikV2WithControllers(StrategyV2Base):
                     "Global PnL %": f"{performance_report.global_pnl_pct:.2f}%",
                     "Volume Traded": f"${performance_report.volume_traded:.2f}"
                 })
-
+        
         # Performance summary table
         if performance_data:
             lines.append(f"\n{'=' * 80}")
@@ -501,12 +499,15 @@ class VikV2WithControllers(StrategyV2Base):
 
             performance_df = pd.DataFrame(performance_data)
             lines.append(format_df_for_printout(performance_df, table_format="psql", index=False))
+        
+        # Basic account info
+        balance_df = self.get_balance_df()
+        lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
 
-            # Additional global breakdowns (use all executors including history from DB)
-            try:
-                lines.extend(self._format_global_breakdowns(self._get_all_executors_including_history()))
-            except Exception as e:
-                # Avoid breaking format_status if something goes wrong in the breakdowns
-                self.logger().debug(f"Error while generating global breakdowns: {e}")
+        try:
+            df = self.active_orders_df()
+            lines.extend(["", "  Orders:"] + ["    " + line for line in df.to_string(index=False).split("\n")])
+        except ValueError:
+            lines.extend(["", "  No active maker orders."])
 
         return "\n".join(lines)

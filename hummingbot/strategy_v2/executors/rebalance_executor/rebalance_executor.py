@@ -60,8 +60,8 @@ class RebalanceExecutor(ExecutorBase):
         for item in self.assets_to_rebalance_info:
             self.send_order_to_exchange(item['pair'], item['order_side'], item['order_amount'])
             self._strategy.notify_hb_app(
-                f"Rebalancing {'buy' if item['is_buy'] else 'sell'} {abs(item['diff'])} {item['asset']} "
-                f"via {item['order_side'].name} {item['order_amount']} {item['pair']} "
+                f"Rebalancing {'buy' if item['is_buy'] else 'sell'} {round(abs(item['diff']), 6)} {item['asset']} "
+                f"via {item['order_side'].name} {round(item['order_amount'], 6)} {item['pair']} "
                 f"({round(abs(item['diff_in_rebalance_asset']), 2)} {self.config.rebalance_asset})"
             )
 
