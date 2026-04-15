@@ -75,9 +75,11 @@ WS_ORDER_STATE = {
 # Websocket event types
 PUBLIC_TRADES_ENDPOINT_NAME = "spot@public.aggre.deals.v3.api.pb"
 PUBLIC_DIFF_ENDPOINT_NAME = "spot@public.aggre.depth.v3.api.pb"
+PUBLIC_BOOK_TICKER_ENDPOINT_NAME = "spot@public.aggre.bookTicker.v3.api.pb"
 
 TRADE_EVENT_TYPE = "public.aggre.deals"
 DIFF_EVENT_TYPE = "public.aggre.depth"
+BOOK_TICKER_EVENT_TYPE = "public.aggre.bookTicker"
 
 USER_TRADES_ENDPOINT_NAME = "spot@private.deals.v3.api.pb"
 USER_ORDERS_ENDPOINT_NAME = "spot@private.orders.v3.api.pb"

@@ -1,11 +1,14 @@
 import asyncio
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.mexc import mexc_constants as CONSTANTS, mexc_web_utils as web_utils
 from hummingbot.connector.exchange.mexc.mexc_order_book import MexcOrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.event.events import OrderBookBestBidAskEvent, OrderBookDataSourceEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -34,6 +37,7 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        self._trading_pair_cache = {}  # symbol -> trading_pair
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -72,10 +76,12 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         try:
             trade_params = []
             depth_params = []
+            best_bidask_params = []
             for trading_pair in self._trading_pairs:
                 symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 trade_params.append(f"{CONSTANTS.PUBLIC_TRADES_ENDPOINT_NAME}@100ms@{symbol}")
                 depth_params.append(f"{CONSTANTS.PUBLIC_DIFF_ENDPOINT_NAME}@100ms@{symbol}")
+                best_bidask_params.append(f"{CONSTANTS.PUBLIC_BOOK_TICKER_ENDPOINT_NAME}@10ms@{symbol}")
             payload = {
                 "method": "SUBSCRIPTION",
                 "params": trade_params,
@@ -90,8 +96,16 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
             }
             subscribe_orderbook_request: WSJSONRequest = WSJSONRequest(payload=payload)
 
-            await ws.send(subscribe_trade_request)
+            payload = {
+                "method": "SUBSCRIPTION",
+                "params": best_bidask_params,
+                "id": 3
+            }
+            subscribe_best_bidask_request: WSJSONRequest = WSJSONRequest(payload=payload)
+
+            # await ws.send(subscribe_trade_request)
             await ws.send(subscribe_orderbook_request)
+            await ws.send(subscribe_best_bidask_request)
 
             self.logger().info("Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
@@ -138,6 +152,37 @@ class MexcAPIOrderBookDataSource(OrderBookTrackerDataSource):
         channel = ""
         if "code" not in event_message:
             event_type = event_message.get("channel", "")
-            channel = (self._diff_messages_queue_key if CONSTANTS.DIFF_EVENT_TYPE in event_type
-                       else self._trade_messages_queue_key)
+            if CONSTANTS.DIFF_EVENT_TYPE in event_type:
+                channel = self._diff_messages_queue_key
+            elif CONSTANTS.TRADE_EVENT_TYPE in event_type:
+                channel = self._trade_messages_queue_key
+            elif CONSTANTS.BOOK_TICKER_EVENT_TYPE in event_type:
+                safe_ensure_future(self._trigger_best_bidask_event(event_message))
         return channel
+
+    async def _trigger_best_bidask_event(self, event_message: Dict[str, Any]) -> None:
+        ticker = event_message.get("publicbookticker")
+        if not ticker:
+            return
+        exchange_symbol = event_message.get("symbol", "")
+        if not exchange_symbol:
+            return
+
+        trading_pair = self._get_trading_pair_from_cache(exchange_symbol)
+        best_bid_price = Decimal(str(ticker["bidprice"]))
+        best_bid_size = Decimal(str(ticker["bidquantity"]))
+        best_ask_price = Decimal(str(ticker["askprice"]))
+        best_ask_size = Decimal(str(ticker["askquantity"]))
+        ticker_id = event_message.get("sendtime", "")
+        self._connector.trigger_event(
+            OrderBookDataSourceEvent.BEST_BID_ASK_EVENT,
+            OrderBookBestBidAskEvent(trading_pair, ticker_id, best_bid_price, best_ask_price, best_bid_size, best_ask_size)
+        )
+
+    def _get_trading_pair_from_cache(self, exchange_symbol: str) -> str:
+        if exchange_symbol in self._trading_pair_cache:
+            return self._trading_pair_cache[exchange_symbol]
+        trading_pair = self._connector.trading_pair_associated_to_exchange_symbol_sync(exchange_symbol)
+        self.logger().info(f">>>(mexc) New pair cache: {exchange_symbol} -> {trading_pair}")
+        self._trading_pair_cache[exchange_symbol] = trading_pair
+        return trading_pair
