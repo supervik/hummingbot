@@ -128,6 +128,8 @@ class TriangularExecutor(ExecutorBase):
 
         # Find the pair that converts maker_base → usdt currency
         self.usdt_pair = self._find_base_usd_pair()
+        self.min_order_size_in_base = self.config.min_usdt / self.get_price(self.config.connector_name, self.usdt_pair, price_type=PriceType.MidPrice)
+        self.notify("info", f"Minimum order size in base asset: {self.min_order_size_in_base}")
 
         self._best_bidask_forwarder = SourceInfoEventForwarder(self.process_best_bidask_event)
 
@@ -540,7 +542,7 @@ class TriangularExecutor(ExecutorBase):
         adjusted_candidate = self.connectors[self.config.connector_name].budget_checker.adjust_candidate(order_candidate, all_or_none=False)
         quantized_amount = self.connectors[self.config.connector_name].quantize_order_amount(self.config.maker_pair, adjusted_candidate.amount)
         
-        if quantized_amount < self.trading_rules_maker.min_order_size:
+        if quantized_amount < self.trading_rules_maker.min_order_size or quantized_amount < self.min_order_size_in_base:
             self.notify("warning", f"Not enough balance to place maker {side.name} order amount {amount} (adjusted: {quantized_amount}) at price {price} on {self.config.maker_pair}")
             return None
 

@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import Dict, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
@@ -21,7 +22,6 @@ from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.rebalance_executor.data_types import RebalanceExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
-from hummingbot.connector.trading_rule import TradingRule
 
 
 class RebalanceExecutor(ExecutorBase):
@@ -35,7 +35,7 @@ class RebalanceExecutor(ExecutorBase):
 
     def __init__(self, strategy: ScriptStrategyBase, config: RebalanceExecutorConfig,
                  update_interval: float = 1.0, max_retries: int = 10):
-        
+
         super().__init__(strategy=strategy, config=config, connectors=[config.connector_name],
                          update_interval=update_interval)
         self.config: RebalanceExecutorConfig = config
@@ -78,11 +78,11 @@ class RebalanceExecutor(ExecutorBase):
             amount=amount,
             price=price)
 
-        adjusted_candidate = self.connectors[self.config.connector_name].budget_checker.adjust_candidate(order_candidate, all_or_none=True)    
+        adjusted_candidate = self.connectors[self.config.connector_name].budget_checker.adjust_candidate(order_candidate, all_or_none=True)
         if adjusted_candidate.amount == Decimal("0"):
             self.logger().info(f"Not enough balance to place {side.name} order amount {amount} on {trading_pair}")
             return None
-        
+
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=trading_pair,
@@ -91,7 +91,7 @@ class RebalanceExecutor(ExecutorBase):
             amount=adjusted_candidate.amount,
             price=Decimal("0"))
         self.logger().info(f"Sent {side.name} order amount {amount} on {trading_pair}, id = {order_id} ")
-        
+
     def _resolve_pair(self, asset: str) -> Optional[tuple]:
         """
         Finds the trading pair for an asset against the rebalance asset.
