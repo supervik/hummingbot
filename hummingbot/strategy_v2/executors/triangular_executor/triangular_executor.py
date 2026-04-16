@@ -25,6 +25,7 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.triangular_executor.data_types import (
+    CancellationState,
     HedgingState,
     TakerOrderInfo,
     TakerPairDepthTracker,
@@ -42,6 +43,8 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 class TriangularExecutor(ExecutorBase):
     _logger = None
     MIN_DEPTH_SAMPLES = 10  # Minimum samples required before using depth for calculations
+    CANCEL_RETRY_BASE_DELAY = 2.0   # seconds before first retry after a failed cancel
+    CANCEL_RETRY_MAX_DELAY = 60.0   # cap on exponential backoff
     #1/4 CSV_SYNC_PATH = "scripts/data/triangular_sync_snapshot.csv"  # Disabled: CSV sync not used currently
 
     def notify(self, level: str, message: str, to_app: bool = False):
@@ -95,8 +98,8 @@ class TriangularExecutor(ExecutorBase):
         self.maker_target_sell_price = Decimal("0")
         self.maker_bid_order = None
         self.maker_ask_order = None
-        self.maker_bid_cancellation_in_progress = False
-        self.maker_ask_cancellation_in_progress = False
+        self.bid_cancel = CancellationState()
+        self.ask_cancel = CancellationState()
         # Track all active maker order IDs to handle race conditions (cancel + fill)
         self.current_maker_order_ids = set()
         self.hedge_mode = False
@@ -589,12 +592,12 @@ class TriangularExecutor(ExecutorBase):
         if self.maker_bid_order and event.order_id == self.maker_bid_order.order_id:
             self.notify("info", f"Maker bid order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_bid_order = None
-            self.maker_bid_cancellation_in_progress = False
+            self.bid_cancel.reset()
             # Do NOT remove from current_maker_order_ids - late fills may still arrive
         elif self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
             self.notify("info", f"Maker ask order canceled, id = {event.order_id} on {self.config.maker_pair}")
             self.maker_ask_order = None
-            self.maker_ask_cancellation_in_progress = False
+            self.ask_cancel.reset()
             # Do NOT remove from current_maker_order_ids - late fills may still arrive
 
     def _handle_failed_maker_order(self, order_type: str, order_id: str):
@@ -615,13 +618,13 @@ class TriangularExecutor(ExecutorBase):
         except Exception:
             pass  # Order may not exist, ignore cancellation errors
         
-        # Clear order tracking and reset cancellation flag
+        # Clear order tracking and reset cancellation state
         if order_type == "bid":
             self.maker_bid_order = None
-            self.maker_bid_cancellation_in_progress = False
+            self.bid_cancel.reset()
         else:  # ask
             self.maker_ask_order = None
-            self.maker_ask_cancellation_in_progress = False
+            self.ask_cancel.reset()
         
         # Remove from tracking set since this order is truly dead
         self.current_maker_order_ids.discard(order_id)
@@ -669,13 +672,13 @@ class TriangularExecutor(ExecutorBase):
             # Reset cancellation flags - determine which side based on order_id
             # (order object might be None if cancellation arrived first)
             if self.maker_bid_order and event.order_id == self.maker_bid_order.order_id:
-                self.maker_bid_cancellation_in_progress = False
+                self.bid_cancel.reset()
             elif self.maker_ask_order and event.order_id == self.maker_ask_order.order_id:
-                self.maker_ask_cancellation_in_progress = False
+                self.ask_cancel.reset()
             else:
-                # Order was already cancelled (object is None), reset both flags to be safe
-                self.maker_bid_cancellation_in_progress = False
-                self.maker_ask_cancellation_in_progress = False
+                # Order was already cancelled (object is None), reset both sides to be safe
+                self.bid_cancel.reset()
+                self.ask_cancel.reset()
             if self.is_order_size_less_than_min(event.amount):
                 self.notify("info", f"Filled order amount {event.amount} is less than the minimum usdt amount. Continue")
             else:
@@ -1135,11 +1138,20 @@ class TriangularExecutor(ExecutorBase):
             return
         
         # Check if cancellation is already in progress to prevent duplicate attempts
-        cancellation_flag = self.maker_bid_cancellation_in_progress if trade_type == TradeType.BUY else self.maker_ask_cancellation_in_progress
-        if cancellation_flag:
-            self.notify("info", f"{order_type} order {order.order_id} cancellation already in progress, skipping")
-            return
-        
+        cancel_state = self.bid_cancel if trade_type == TradeType.BUY else self.ask_cancel
+        if cancel_state.in_progress:
+            if cancel_state.should_retry(self.CANCEL_RETRY_BASE_DELAY, self.CANCEL_RETRY_MAX_DELAY):
+                self.notify(
+                    "warning",
+                    f"{order_type} order {order.order_id} cancel timed out after {cancel_state.elapsed():.1f}s "
+                    f"(attempt {cancel_state.retries + 1}). Retrying.", to_app=True
+                )
+                cancel_state.increment_retry()
+                # Fall through to check_and_cancel_maker_order below
+            else:
+                self.notify("info", f"{order_type} order {order.order_id} cancellation already in progress, skipping")
+                return
+
         order_price = order.order.price
         
         if trade_type == TradeType.BUY:
@@ -1157,10 +1169,8 @@ class TriangularExecutor(ExecutorBase):
                 return
             
             # Set cancellation flag to prevent duplicate attempts
-            if type == "Bid":
-                self.maker_bid_cancellation_in_progress = True
-            else:
-                self.maker_ask_cancellation_in_progress = True
+            cancel_state = self.bid_cancel if type == "Bid" else self.ask_cancel
+            cancel_state.start()
             
             self.notify("info", f"{type} order {order.order_id} profitability {profitability} on {self.config.maker_pair} is out of profitability range. Cancelling order.")
             self._strategy.cancel(self.config.connector_name, self.config.maker_pair, order.order_id)

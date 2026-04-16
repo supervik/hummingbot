@@ -1,3 +1,4 @@
+import time
 from collections import deque
 from decimal import Decimal
 from typing import List, Literal, Optional, Union
@@ -11,6 +12,42 @@ from hummingbot.core.event.events import (
     SellOrderCompletedEvent,
 )
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
+
+
+class CancellationState:
+    """
+    Tracks per-side maker order cancellation with exponential backoff.
+    All mutation goes through start() / reset() / increment_retry().
+    """
+
+    def __init__(self):
+        self.in_progress: bool = False
+        self.timestamp: Optional[float] = None
+        self.retries: int = 0
+
+    def start(self) -> None:
+        self.in_progress = True
+        self.timestamp = time.time()
+
+    def reset(self) -> None:
+        self.in_progress = False
+        self.timestamp = None
+        self.retries = 0
+
+    def elapsed(self) -> Optional[float]:
+        return time.time() - self.timestamp if self.timestamp is not None else None
+
+    def backoff_delay(self, base: float, cap: float) -> float:
+        return min(base * (2 ** self.retries), cap)
+
+    def should_retry(self, base: float, cap: float) -> bool:
+        elapsed = self.elapsed()
+        return elapsed is not None and elapsed >= self.backoff_delay(base, cap)
+
+    def increment_retry(self) -> None:
+        """Reset the in-progress flag and bump the retry counter for the next attempt."""
+        self.in_progress = False
+        self.retries += 1
 
 
 class TakerPairDepthTracker:
