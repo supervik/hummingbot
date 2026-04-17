@@ -188,3 +188,11 @@ class TriangularExecutorConfig(ExecutorConfigBase):
     taker_retry_delay: float = 10.0
     completion_wait_time: float = 5.0
     kill_switch_pnl_threshold: Decimal
+    # Extra taker depth to account for cheaper levels that will fill before this one.
+    # The executor adds these to its own effective amounts when probing order-book depth.
+    # Zero by default — single-level behaviour is completely unchanged.
+    extra_base_amount: Decimal = Decimal("0")
+    extra_quote_amount: Decimal = Decimal("0")
+    # Optional label shown in log prefix when multiple levels share the same triangle
+    # (e.g. "L1", "L2"). None means no label is shown — keeps logs clean for solo triangles.
+    level_label: Optional[str] = None

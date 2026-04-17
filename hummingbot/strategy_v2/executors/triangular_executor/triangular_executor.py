@@ -55,7 +55,8 @@ class TriangularExecutor(ExecutorBase):
         :param message: The message to log/notify
         :param to_app: Whether to also send the message to the HB app
         """
-        full_message = f"({self.config.maker_pair}) {message}"
+        label = f" {self.config.level_label}" if self.config.level_label else ""
+        full_message = f"({self.config.maker_pair}{label}) {message}"
 
         # Log
         if level == "error":
@@ -415,9 +416,13 @@ class TriangularExecutor(ExecutorBase):
         maker_bid_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestBid)
         maker_ask_price = self.get_price(self.config.connector_name, self.config.maker_pair, price_type=PriceType.BestAsk)
 
+        # Add extra amounts from cheaper levels that will consume taker depth before this one.
+        depth_base = self.effective_base_amount + self.config.extra_base_amount
+        depth_quote = self.effective_quote_amount + self.config.extra_quote_amount
+
         # Sell order on maker, buy on taker_1 (same base, opposite side)
         if self.place_sell_order:
-            sell_amount_base = self.effective_base_amount
+            sell_amount_base = depth_base
             sell_amount_quote = sell_amount_base * maker_ask_price
 
             # taker_1: always BUY when selling on maker (opposite side, same base amount)
@@ -441,7 +446,7 @@ class TriangularExecutor(ExecutorBase):
 
         # Buy order on maker, sell on taker_1 (same base, opposite side)
         if self.place_buy_order:
-            buy_amount_quote = self.effective_quote_amount
+            buy_amount_quote = depth_quote
             buy_amount_base = buy_amount_quote / maker_bid_price if maker_bid_price > Decimal("0") else Decimal("0")
 
             # taker_1: always SELL when buying on maker (opposite side, same base amount)
@@ -1187,6 +1192,8 @@ class TriangularExecutor(ExecutorBase):
             "maker_pair": maker_pair,
             "base": base,
             "quote": quote,
+            "min_profit": self.config.min_profit,
+            "max_profit": self.config.max_profit,
             "hedge_mode": self.hedge_mode,
             "last_maker_order_timestamp": self.last_maker_order_timestamp,
             "last_taker_order_timestamp": self.last_taker_order_timestamp,

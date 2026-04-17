@@ -161,6 +161,9 @@ class TriangularMultipleConfig(ControllerConfigBase):
         Returns per-triangle info including maker/taker pairs and maker order sizes.
         - base_amount: maker base units allocated (0 if buy_only)
         - quote_amount: maker quote units allocated (0 if sell_only)
+        - extra_base_amount: sum of base_amounts from cheaper levels on the same triangle (0 if solo)
+        - extra_quote_amount: sum of quote_amounts from cheaper levels on the same triangle (0 if solo)
+        - level_label: "L1", "L2", ... when multiple levels share the same triangle; None otherwise
         - min_profit, max_profit: per-triangle overrides or global defaults
         - weight: allocation weight for this triangle (default 1.0)
         Shared assets are split proportionally based on weights across triangles that use them.
@@ -189,6 +192,10 @@ class TriangularMultipleConfig(ControllerConfigBase):
                 total_weight = sum(w for _, w in usages.get(quote, []))
                 quote_amount = self._allocate_amount_weighted(quote_balance, weight, total_weight)
 
+            # Resolve effective min/max profit for this triangle (used as the level identity key)
+            eff_min = parsed["min_profit"] if parsed["min_profit"] is not None else self.min_profit
+            eff_max = parsed["max_profit"] if parsed["max_profit"] is not None else self.max_profit
+
             triangle_dicts.append({
                 "maker": maker_pair,
                 "taker_1": parsed["taker_1_pair"],
@@ -201,8 +208,32 @@ class TriangularMultipleConfig(ControllerConfigBase):
                 "sell_only": parsed["sell_only"],
                 "min_profit": parsed["min_profit"],
                 "max_profit": parsed["max_profit"],
+                "eff_min_profit": eff_min,
+                "eff_max_profit": eff_max,
                 "weight": weight,
             })
+
+        # For levels sharing the same triangle (same maker + taker pairs), compute extra depth
+        # amounts and assign level labels. Sort by eff_min_profit ascending so cheaper levels
+        # (closer to best bid/ask, fill first) accumulate first.
+        def triangle_key(t):
+            return (t["maker"], t["taker_1"], t["taker_2"])
+
+        groups: Dict[tuple, List] = {}
+        for t in triangle_dicts:
+            groups.setdefault(triangle_key(t), []).append(t)
+
+        for group in groups.values():
+            group.sort(key=lambda t: t["eff_min_profit"])
+            multi_level = len(group) > 1
+            cum_base = Decimal("0")
+            cum_quote = Decimal("0")
+            for idx, t in enumerate(group):
+                t["extra_base_amount"] = cum_base
+                t["extra_quote_amount"] = cum_quote
+                t["level_label"] = f"L{idx + 1}" if multi_level else None
+                cum_base += t["base_amount"]
+                cum_quote += t["quote_amount"]
 
         return triangle_dicts
 
@@ -214,37 +245,41 @@ class TriangularMultiple(ControllerBase):
         self.logger().info(f"Initializing TriangularMultiple controller with configuration: {self.config}")
         self.logger().info(f"Triangle info: {self.config.triangle_info}")
         self.first_run = True
-        # Track per-triangle state: True = ready to create new executor, False = need rebalance first
-        self.ready_for_new_triangle: Dict[str, bool] = {}  # maker_pair -> bool
-        # Track triangles disabled due to PnL kill switch
-        self.disabled_triangles: Set[str] = set()  # maker_pair -> disabled
+        # Track per-level state: True = ready to create new executor, False = need rebalance first.
+        # Key is (maker_pair, taker_1_pair, taker_2_pair, eff_min_profit, eff_max_profit) so that
+        # multiple profit levels on the same triangle are tracked independently.
+        self.ready_for_new_triangle: Dict[tuple, bool] = {}
+        # Track levels disabled due to PnL kill switch (same key as above)
+        self.disabled_triangles: Set[tuple] = set()
 
     async def update_processed_data(self):
         pass
 
-    def _has_failed_executor(self, maker_pair: str) -> bool:
+    def _has_failed_executor(self, maker_pair: str, min_profit: Decimal, max_profit: Decimal) -> bool:
         """
-        Check if any terminated triangular_executor for this maker_pair has CloseType.STOP_LOSS.
-        
+        Check if any terminated triangular_executor for this specific level has CloseType.STOP_LOSS.
+
         :param maker_pair: The maker pair to check
-        :return: True if any failed executor found, False otherwise
+        :param min_profit: Effective min_profit for this level
+        :param max_profit: Effective max_profit for this level
+        :return: True if any failed executor found for this level, False otherwise
         """
         failed_executors = self.filter_executors(
             executors=self.executors_info,
             filter_func=lambda e: (
                 e.type == "triangular_executor"
                 and e.config.maker_pair == maker_pair
+                and e.config.min_profit == min_profit
+                and e.config.max_profit == max_profit
                 and e.close_type == CloseType.STOP_LOSS
             )
         )
         return len(failed_executors) > 0
     
     def determine_executor_actions(self) -> List[ExecutorAction]:
-        # self.logger().info(f"TriangularMultiple controller with triangle conf: {self.config.triangle_info}")
         executor_actions = []
-        
+
         if self.first_run:
-            # Start rebalance executor and exit loop
             rebalance_executor_config = RebalanceExecutorConfig(
                 controller_id=self.config.id,
                 timestamp=self.market_data_provider.time(),
@@ -270,55 +305,63 @@ class TriangularMultiple(ControllerBase):
         if len(active_rebalance_executors) > 0:
             return executor_actions
 
-        # Process each triangle
+        # Process each triangle level
         for triangle in self.config.triangle_info:
             maker_pair = triangle["maker"]
+            taker_1 = triangle["taker_1"]
+            taker_2 = triangle["taker_2"]
             base = triangle["base"]
             quote = triangle["quote"]
-            
-            # Skip disabled triangles
-            if maker_pair in self.disabled_triangles:
+            min_profit = triangle["eff_min_profit"]
+            max_profit = triangle["eff_max_profit"]
+
+            # Unique key per profit level on the same triangle
+            level_key = (maker_pair, taker_1, taker_2, min_profit, max_profit)
+
+            # Skip levels disabled due to kill switch
+            if level_key in self.disabled_triangles:
                 continue
-            
-            # Initialize ready_for_new_triangle to True if not set (first time seeing this triangle)
-            if maker_pair not in self.ready_for_new_triangle:
-                self.ready_for_new_triangle[maker_pair] = True
-            
-            # Get active triangular executors for this triangle
-            active_triangle_executors = self.filter_executors(
+
+            # Initialize state the first time we see this level
+            if level_key not in self.ready_for_new_triangle:
+                self.ready_for_new_triangle[level_key] = True
+
+            # Find the active executor for this specific level (same pairs + same profit band)
+            active_executors_for_level = self.filter_executors(
                 executors=self.executors_info,
-                filter_func=lambda e: e.is_active and e.type == "triangular_executor"
+                filter_func=lambda e: (
+                    e.is_active
+                    and e.type == "triangular_executor"
+                    and e.config.maker_pair == maker_pair
+                    and e.config.min_profit == min_profit
+                    and e.config.max_profit == max_profit
+                )
             )
-            active_triangle_executors_on_pair = self.filter_executors(
-                executors=active_triangle_executors,
-                filter_func=lambda e: e.config.maker_pair == maker_pair
-            )
-            
-            # If executor exists, do nothing (flag stays as is)
-            if len(active_triangle_executors_on_pair) > 0:
+
+            # Executor for this level is already running — nothing to do
+            if len(active_executors_for_level) > 0:
                 continue
-            
-            # No executor for this triangle
-            if self.ready_for_new_triangle[maker_pair]:
-                # Ready for new triangle - create triangular executor
-                # Use per-triangle overrides if available, otherwise use global defaults
-                min_profit = triangle.get("min_profit") if triangle.get("min_profit") is not None else self.config.min_profit
-                max_profit = triangle.get("max_profit") if triangle.get("max_profit") is not None else self.config.max_profit
-                
+
+            if self.ready_for_new_triangle[level_key]:
+                # Create a new executor for this level
                 self.logger().info(
-                    f"Creating executor for triangle {maker_pair} "
-                    f"(min_profit={min_profit}, max_profit={max_profit}, "
-                    f"base_amount={triangle['base_amount']}, quote_amount={triangle['quote_amount']})"
+                    f"Creating executor for triangle {maker_pair} level [{min_profit}-{max_profit}] "
+                    f"label={triangle['level_label']} "
+                    f"(base={triangle['base_amount']} +extra={triangle['extra_base_amount']}, "
+                    f"quote={triangle['quote_amount']} +extra={triangle['extra_quote_amount']})"
                 )
                 config = TriangularExecutorConfig(
                     controller_id=self.config.id,
                     timestamp=self.market_data_provider.time(),
                     connector_name=self.config.connector_name,
                     maker_pair=maker_pair,
-                    taker_1_pair=triangle["taker_1"],
-                    taker_2_pair=triangle["taker_2"],
+                    taker_1_pair=taker_1,
+                    taker_2_pair=taker_2,
                     base_amount=triangle["base_amount"],
                     quote_amount=triangle["quote_amount"],
+                    extra_base_amount=triangle["extra_base_amount"],
+                    extra_quote_amount=triangle["extra_quote_amount"],
+                    level_label=triangle["level_label"],
                     min_profit=min_profit,
                     max_profit=max_profit,
                     fee_maker=self.config.maker_fee,
@@ -332,21 +375,38 @@ class TriangularMultiple(ControllerBase):
                     controller_id=self.config.id,
                     executor_config=config
                 ))
-                # Mark as not ready (executor was created, if it stops we need rebalance)
-                self.ready_for_new_triangle[maker_pair] = False
+                # After creation mark not-ready; restart needs rebalance
+                self.ready_for_new_triangle[level_key] = False
             else:
-                # Not ready - executor stopped, need rebalance first
-                # Create triangle-specific rebalance executor (check base, quote, and optionally fee asset)
+                # Executor stopped — only rebalance when no sibling level for the same triangle
+                # is still actively running (avoids moving assets that are in use)
+                sibling_active = self.filter_executors(
+                    executors=self.executors_info,
+                    filter_func=lambda e: (
+                        e.is_active
+                        and e.type == "triangular_executor"
+                        and e.config.maker_pair == maker_pair
+                        and not (e.config.min_profit == min_profit and e.config.max_profit == max_profit)
+                    )
+                )
+                if len(sibling_active) > 0:
+                    self.logger().info(
+                        f"Level [{min_profit}-{max_profit}] on {maker_pair} stopped but "
+                        f"{len(sibling_active)} sibling level(s) still active — deferring rebalance."
+                    )
+                    continue
+
                 triangle_balances = {
                     base: self.config.balances.get(base, Decimal("0")),
                     quote: self.config.balances.get(quote, Decimal("0"))
                 }
-                
-                # Add fee asset if configured
                 if self.config.fee_asset and self.config.fee_asset in self.config.balances:
                     triangle_balances[self.config.fee_asset] = self.config.balances[self.config.fee_asset]
-                
-                self.logger().info(f"Executor stopped for triangle {maker_pair}, creating rebalance executor for assets: {list(triangle_balances.keys())}")
+
+                self.logger().info(
+                    f"Level [{min_profit}-{max_profit}] on {maker_pair} stopped, "
+                    f"creating rebalance for assets: {list(triangle_balances.keys())}"
+                )
                 rebalance_executor_config = RebalanceExecutorConfig(
                     controller_id=self.config.id,
                     timestamp=self.market_data_provider.time(),
@@ -360,23 +420,20 @@ class TriangularMultiple(ControllerBase):
                     controller_id=self.config.id,
                     executor_config=rebalance_executor_config
                 ))
-                
-                # Check for failed executor right after creating rebalance
-                if self._has_failed_executor(maker_pair):
-                    # Failed executor found - disable triangle
-                    self.ready_for_new_triangle[maker_pair] = False
-                    self.disabled_triangles.add(maker_pair)
+
+                if self._has_failed_executor(maker_pair, min_profit, max_profit):
+                    self.ready_for_new_triangle[level_key] = False
+                    self.disabled_triangles.add(level_key)
                     self.logger().warning(
-                        f"Triangle {maker_pair} disabled due to PnL kill switch. "
+                        f"Level [{min_profit}-{max_profit}] on {maker_pair} disabled due to PnL kill switch. "
                         f"Rebalance will run but no new executor will be created."
                     )
                 else:
-                    # No failure - normal flow, re-enable after rebalance
-                    self.ready_for_new_triangle[maker_pair] = True
-                
+                    self.ready_for_new_triangle[level_key] = True
+
                 # Only create one rebalance at a time
                 break
-        
+
         return executor_actions
         
     def to_format_status(self) -> List[str]:
@@ -392,8 +449,10 @@ class TriangularMultiple(ControllerBase):
         # Add ready_for_new_triangle to triangle info for status display
         # triangle_info_with_state = []
         # for triangle in self.config.triangle_info:
+        #     level_key = (triangle["maker"], triangle["taker_1"], triangle["taker_2"],
+        #                  triangle["eff_min_profit"], triangle["eff_max_profit"])
         #     triangle_copy = triangle.copy()
-        #     triangle_copy["ready_for_new_triangle"] = self.ready_for_new_triangle.get(triangle["maker"], True)
+        #     triangle_copy["ready_for_new_triangle"] = self.ready_for_new_triangle.get(level_key, True)
         #     triangle_info_with_state.append(triangle_copy)
         # status.append(f"Triangle Info: {triangle_info_with_state}")
         # for executor in self.executors_info:
