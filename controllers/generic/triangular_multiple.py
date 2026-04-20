@@ -378,24 +378,8 @@ class TriangularMultiple(ControllerBase):
                 # After creation mark not-ready; restart needs rebalance
                 self.ready_for_new_triangle[level_key] = False
             else:
-                # Executor stopped — only rebalance when no sibling level for the same triangle
-                # is still actively running (avoids moving assets that are in use)
-                sibling_active = self.filter_executors(
-                    executors=self.executors_info,
-                    filter_func=lambda e: (
-                        e.is_active
-                        and e.type == "triangular_executor"
-                        and e.config.maker_pair == maker_pair
-                        and not (e.config.min_profit == min_profit and e.config.max_profit == max_profit)
-                    )
-                )
-                if len(sibling_active) > 0:
-                    self.logger().info(
-                        f"Level [{min_profit}-{max_profit}] on {maker_pair} stopped but "
-                        f"{len(sibling_active)} sibling level(s) still active — deferring rebalance."
-                    )
-                    continue
-
+                # Executor stopped — rebalance this level's allocated assets.
+                # Sibling levels are unaffected since assets are split proportionally per level.
                 triangle_balances = {
                     base: self.config.balances.get(base, Decimal("0")),
                     quote: self.config.balances.get(quote, Decimal("0"))
